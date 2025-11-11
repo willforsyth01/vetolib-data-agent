@@ -1,14 +1,23 @@
 name: Vetolib one-off CSV
 
 on:
-  workflow_dispatch: {}   # allows you to trigger manually
+  workflow_dispatch: {}   # manual trigger
 
 jobs:
   build-csv:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Show repo files (debug)
+        run: |
+          pwd
+          ls -la
+          test -f vetolib_berlin_crawler.py || { echo "Missing vetolib_berlin_crawler.py"; exit 1; }
+          test -f requirements.txt || { echo "Missing requirements.txt"; exit 1; }
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -20,21 +29,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run crawler
+      - name: Run Vetolib crawler (safe mode: smaller pulls)
         env:
-          NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}  # optional
+          NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
         run: |
+          set -e
           mkdir -p out
           python vetolib_berlin_crawler.py \
             --city "Berlin" \
-            --max-results 5000 \
+            --max-results 2000 \
+            --tiles 2 \
             --output-dir ./out \
-            --enrich-websites
+            --no-geocode
+          echo "Run finished."
+          ls -la out || true
 
-      - name: Upload CSV and JSONL
+      - name: Upload CSV/JSONL artifacts (even if one is missing)
         uses: actions/upload-artifact@v4
         with:
           name: vetolib-berlin
           path: |
             out/clinics_berlin.csv
             out/clinics_berlin.jsonl
+          if-no-files-found: warn

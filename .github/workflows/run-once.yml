@@ -1,4 +1,4 @@
-name: Vetolib one-off CSV
+name: Vetolib full Berlin CSV
 
 on:
   workflow_dispatch: {}   # manual trigger
@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -19,24 +20,10 @@ jobs:
           set -e
           echo "Repo contents:"
           ls -la
-
-          # Find crawler and requirements anywhere in the repo
           CRAWLER="$(git ls-files | grep -E '(^|/|\\)vetolib_berlin_crawler\.py$' | head -n 1 || true)"
           REQS="$(git ls-files | grep -E '(^|/|\\)requirements\.txt$' | head -n 1 || true)"
-
-          if [ -z "$CRAWLER" ]; then
-            echo "❌ Could not find vetolib_berlin_crawler.py in the repo."
-            exit 1
-          fi
-          if [ -z "$REQS" ]; then
-            echo "❌ Could not find requirements.txt in the repo."
-            exit 1
-          fi
-
-          echo "✅ Crawler: $CRAWLER"
-          echo "✅ Requirements: $REQS"
-
-          # Export for later steps
+          if [ -z "$CRAWLER" ]; then echo "❌ Missing vetolib_berlin_crawler.py"; exit 1; fi
+          if [ -z "$REQS" ]; then echo "❌ Missing requirements.txt"; exit 1; fi
           echo "crawler=$CRAWLER" >> "$GITHUB_OUTPUT"
           echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
 
@@ -50,43 +37,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r "${{ steps.locate.outputs.reqs }}"
 
-      - name: Check which flags the crawler supports
+      - name: Detect supported flags
         id: flags
         shell: bash
         run: |
-          set -e
-          # Show help text; if it contains --tiles we know we have the new script
           HELP_OUT="$(python "${{ steps.locate.outputs.crawler }}" --help || true)"
-          echo "---- Help output ----"
-          echo "$HELP_OUT"
-          echo "---------------------"
-
           if echo "$HELP_OUT" | grep -q -- '--tiles'; then
-            echo "safe_cmd=python \"${{ steps.locate.outputs.crawler }}\" --city \"Berlin\" --max-results 2000 --tiles 2 --output-dir \"$(dirname "${{ steps.locate.outputs.crawler }}")/out\" --no-geocode" >> "$GITHUB_OUTPUT"
+            echo 'cmd=python "${{ steps.locate.outputs.crawler }}" --city "Berlin" --max-results 5000 --tiles 3 --output-dir "./out" --enrich-websites' >> "$GITHUB_OUTPUT"
           else
-            # Fallback for the older script without flags
-            echo "safe_cmd=python \"${{ steps.locate.outputs.crawler }}\"" >> "$GITHUB_OUTPUT"
+            echo 'cmd=python "${{ steps.locate.outputs.crawler }}"' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run Vetolib crawler (safe mode)
+      - name: Run Vetolib crawler (full mode)
         env:
           NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
         shell: bash
         run: |
           set -e
-          OUTDIR="$(dirname "${{ steps.locate.outputs.crawler }}")/out"
-          mkdir -p "$OUTDIR"
-          echo "Executing:"
-          echo "${{ steps.flags.outputs.safe_cmd }}"
-          eval "${{ steps.flags.outputs.safe_cmd }}"
+          mkdir -p out
+          echo "Executing full crawler: ${{ steps.flags.outputs.cmd }}"
+          # Retry up to 3 times in case Overpass throttles
+          for i in 1 2 3; do
+            eval ${{ steps.flags.outputs.cmd }} && break || { echo "Attempt $i failed; retrying..."; sleep 15; }
+          done
           echo "Run finished."
-          ls -la "$OUTDIR" || true
+          ls -la out || true
 
       - name: Upload CSV/JSONL artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vetolib-berlin
+          name: vetolib-berlin-full
           path: |
-            **/out/clinics_berlin.csv
-            **/out/clinics_berlin.jsonl
+            out/clinics_berlin.csv
+            out/clinics_berlin.jsonl
           if-no-files-found: warn

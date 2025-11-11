@@ -12,12 +12,33 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Show repo files (debug)
+      - name: Locate crawler and requirements
+        id: locate
+        shell: bash
         run: |
-          pwd
+          set -e
+          echo "Repo contents:"
           ls -la
-          test -f vetolib_berlin_crawler.py || { echo "Missing vetolib_berlin_crawler.py"; exit 1; }
-          test -f requirements.txt || { echo "Missing requirements.txt"; exit 1; }
+
+          # Find crawler and requirements anywhere in the repo
+          CRAWLER="$(git ls-files | grep -E '(^|/|\\)vetolib_berlin_crawler\.py$' | head -n 1 || true)"
+          REQS="$(git ls-files | grep -E '(^|/|\\)requirements\.txt$' | head -n 1 || true)"
+
+          if [ -z "$CRAWLER" ]; then
+            echo "❌ Could not find vetolib_berlin_crawler.py in the repo."
+            exit 1
+          fi
+          if [ -z "$REQS" ]; then
+            echo "❌ Could not find requirements.txt in the repo."
+            exit 1
+          fi
+
+          echo "✅ Crawler: $CRAWLER"
+          echo "✅ Requirements: $REQS"
+
+          # Export for later steps
+          echo "crawler=$CRAWLER" >> "$GITHUB_OUTPUT"
+          echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,28 +48,45 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r "${{ steps.locate.outputs.reqs }}"
 
-      - name: Run Vetolib crawler (safe mode: smaller pulls)
-        env:
-          NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
+      - name: Check which flags the crawler supports
+        id: flags
+        shell: bash
         run: |
           set -e
-          mkdir -p out
-          python vetolib_berlin_crawler.py \
-            --city "Berlin" \
-            --max-results 2000 \
-            --tiles 2 \
-            --output-dir ./out \
-            --no-geocode
-          echo "Run finished."
-          ls -la out || true
+          # Show help text; if it contains --tiles we know we have the new script
+          HELP_OUT="$(python "${{ steps.locate.outputs.crawler }}" --help || true)"
+          echo "---- Help output ----"
+          echo "$HELP_OUT"
+          echo "---------------------"
 
-      - name: Upload CSV/JSONL artifacts (even if one is missing)
+          if echo "$HELP_OUT" | grep -q -- '--tiles'; then
+            echo "safe_cmd=python \"${{ steps.locate.outputs.crawler }}\" --city \"Berlin\" --max-results 2000 --tiles 2 --output-dir \"$(dirname "${{ steps.locate.outputs.crawler }}")/out\" --no-geocode" >> "$GITHUB_OUTPUT"
+          else
+            # Fallback for the older script without flags
+            echo "safe_cmd=python \"${{ steps.locate.outputs.crawler }}\"" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Vetolib crawler (safe mode)
+        env:
+          NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
+        shell: bash
+        run: |
+          set -e
+          OUTDIR="$(dirname "${{ steps.locate.outputs.crawler }}")/out"
+          mkdir -p "$OUTDIR"
+          echo "Executing:"
+          echo "${{ steps.flags.outputs.safe_cmd }}"
+          eval "${{ steps.flags.outputs.safe_cmd }}"
+          echo "Run finished."
+          ls -la "$OUTDIR" || true
+
+      - name: Upload CSV/JSONL artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vetolib-berlin
           path: |
-            out/clinics_berlin.csv
-            out/clinics_berlin.jsonl
+            **/out/clinics_berlin.csv
+            **/out/clinics_berlin.jsonl
           if-no-files-found: warn

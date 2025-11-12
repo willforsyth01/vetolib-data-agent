@@ -1,7 +1,29 @@
-name: Vetolib full Berlin CSV
+name: Vetolib one-off CSV
 
 on:
-  workflow_dispatch: {}   # manual trigger
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        type: choice
+        options: [test, full]
+        default: test
+      max_results:
+        description: "Overpass max results per tile"
+        type: number
+        default: 2000
+      tiles:
+        description: "Split Berlin bbox into N×N tiles"
+        type: number
+        default: 2
+      geocode:
+        description: "Use Nominatim reverse geocoding (slower)"
+        type: boolean
+        default: false
+      enrich_websites:
+        description: "Fetch clinic websites to parse opening hours"
+        type: boolean
+        default: false
 
 jobs:
   build-csv:
@@ -13,19 +35,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Locate crawler and requirements
+      - name: Verify repo contents
         id: locate
         shell: bash
         run: |
           set -e
-          echo "Repo contents:"
-          ls -la
           CRAWLER="$(git ls-files | grep -E '(^|/|\\)vetolib_berlin_crawler\.py$' | head -n 1 || true)"
           REQS="$(git ls-files | grep -E '(^|/|\\)requirements\.txt$' | head -n 1 || true)"
-          if [ -z "$CRAWLER" ]; then echo "❌ Missing vetolib_berlin_crawler.py"; exit 1; fi
-          if [ -z "$REQS" ]; then echo "❌ Missing requirements.txt"; exit 1; fi
+          test -n "$CRAWLER" || { echo "❌ Missing vetolib_berlin_crawler.py"; exit 1; }
+          test -n "$REQS" || { echo "❌ Missing requirements.txt"; exit 1; }
           echo "crawler=$CRAWLER" >> "$GITHUB_OUTPUT"
           echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
+          echo "✅ Found: $CRAWLER and $REQS"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -37,28 +58,56 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r "${{ steps.locate.outputs.reqs }}"
 
-      - name: Detect supported flags
-        id: flags
+      - name: Build command from inputs
+        id: cmd
         shell: bash
+        env:
+          MODE: ${{ github.event.inputs.mode }}
+          MAX_RESULTS: ${{ github.event.inputs.max_results }}
+          TILES: ${{ github.event.inputs.tiles }}
+          GEOCODE: ${{ github.event.inputs.geocode }}
+          ENRICH: ${{ github.event.inputs.enrich_websites }}
         run: |
-          HELP_OUT="$(python "${{ steps.locate.outputs.crawler }}" --help || true)"
-          if echo "$HELP_OUT" | grep -q -- '--tiles'; then
-            echo 'cmd=python "${{ steps.locate.outputs.crawler }}" --city "Berlin" --max-results 5000 --tiles 3 --output-dir "./out" --enrich-websites' >> "$GITHUB_OUTPUT"
+          set -e
+          # Defaults depending on mode
+          if [ "$MODE" = "test" ]; then
+            MAX_RESULTS="${MAX_RESULTS:-2000}"
+            TILES="${TILES:-2}"
+            GEOCODE="${GEOCODE:-false}"
+            ENRICH="${ENRICH:-false}"
           else
-            echo 'cmd=python "${{ steps.locate.outputs.crawler }}"' >> "$GITHUB_OUTPUT"
+            # full
+            MAX_RESULTS="${MAX_RESULTS:-5000}"
+            TILES="${TILES:-3}"
+            GEOCODE="${GEOCODE:-true}"
+            ENRICH="${ENRICH:-true}"
           fi
 
-      - name: Run Vetolib crawler (full mode)
+          FLAGS="--city \"Berlin\" --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
+          if [ "$GEOCODE" = "false" ]; then
+            FLAGS="$FLAGS --no-geocode"
+          fi
+          if [ "$ENRICH" = "true" ]; then
+            FLAGS="$FLAGS --enrich-websites"
+          fi
+
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+          echo "✅ Using flags: $FLAGS"
+
+      - name: Run Vetolib crawler
         env:
           NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
         shell: bash
         run: |
           set -e
           mkdir -p out
-          echo "Executing full crawler: ${{ steps.flags.outputs.cmd }}"
-          # Retry up to 3 times in case Overpass throttles
+          echo "Executing:"
+          echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
+          # retry up to 3 times in case Overpass throttles
           for i in 1 2 3; do
-            eval ${{ steps.flags.outputs.cmd }} && break || { echo "Attempt $i failed; retrying..."; sleep 15; }
+            python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }} && break || {
+              echo "Attempt $i failed; backing off..."; sleep $((10 * i));
+            }
           done
           echo "Run finished."
           ls -la out || true
@@ -66,7 +115,7 @@ jobs:
       - name: Upload CSV/JSONL artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: vetolib-berlin-full
+          name: vetolib-berlin-${{ github.event.inputs.mode || 'test' }}
           path: |
             out/clinics_berlin.csv
             out/clinics_berlin.jsonl

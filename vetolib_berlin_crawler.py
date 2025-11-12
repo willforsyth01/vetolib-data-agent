@@ -48,16 +48,11 @@ OVERPASS_URLS = [
 ]
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
-HEADERS = {"User-Agent": "Vetolib-Agent/1.2 (+https://vetolib.app)"}
+HEADERS = {"User-Agent": "Vetolib-Agent/1.3 (+https://vetolib.app)"}
 EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
-
-# --- Opening-hours parsing flags ---
-# We rely on opentimeparser if available; otherwise we fall back to simple heuristics.
-TRY_OPENTIMEPARSER = True
 
 # ----------------------------
 # Supabase schema columns (aligned to clinics_rows.csv)
-# NOTE: If your live table differs, adjust names/order here.
 # ----------------------------
 SB_COLUMNS = [
     # identity + contact
@@ -131,25 +126,6 @@ def tile_bbox(bbox: Tuple[float,float,float,float], tiles_per_side: int) -> List
 # Opening hours parsing / extraction
 # ----------------------------
 
-OH_DAY_MAP = {
-    # German
-    "mo":"Mo","montag":"Mo",
-    "di":"Tu","dienstag":"Tu",
-    "mi":"We","mittwoch":"We",
-    "do":"Th","donnerstag":"Th",
-    "fr":"Fr","freitag":"Fr",
-    "sa":"Sa","samstag":"Sa",
-    "so":"Su","sonntag":"Su",
-    # English
-    "mon":"Mo","monday":"Mo",
-    "tue":"Tu","tues":"Tu","tuesday":"Tu",
-    "wed":"We","wednesday":"We",
-    "thu":"Th","thur":"Th","thurs":"Th","thursday":"Th",
-    "fri":"Fr","friday":"Fr",
-    "sat":"Sa","saturday":"Sa",
-    "sun":"Su","sunday":"Su",
-}
-
 def looks_247(s: str) -> bool:
     s = (s or "").lower()
     return any(k in s for k in ["24/7","24-7","24h","24 h","24 stunden","rund um die uhr"])
@@ -189,7 +165,7 @@ def normalize_osm_oh(segments):
     for days, times in segments:
         days = str(days).strip()
         times = str(times).strip()
-        if not days or not times: 
+        if not days or not times:
             continue
         parts.append(f"{days} {times}")
     return "; ".join(parts).strip("; ").strip()
@@ -254,7 +230,7 @@ def extract_hours_text_from_html(html: str) -> str:
     blocks = []
     for el in soup.find_all(text=True):
         s = (el or "").strip()
-        if not s: 
+        if not s:
             continue
         low = s.lower()
         if any(lbl in low for lbl in labels):
@@ -452,7 +428,7 @@ def fill_missing_address(clinics: List[Clinic], city: str) -> List[Clinic]:
         if not (need_street or need_hnr or need_pc):
             continue
         data = nominatim_reverse(c.lat, c.lon)
-        if not data: 
+        if not data:
             continue
         addr = (data or {}).get("address", {}) or {}
         if need_street:

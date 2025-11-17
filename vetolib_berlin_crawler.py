@@ -4,21 +4,13 @@
 """
 Vetolib Web Data Agent — Berlin (DE)
 
-Aligned to Supabase table public.clinics:
+- Fetch clinics from OSM (amenity=veterinary) with Overpass
+- Optional Nominatim reverse geocoding to fill missing address bits
+- Optional website scraping to improve opening_hours + service flags
+- Export CSV/JSONL aligned with Supabase table public.clinics,
+  but ONLY for “safe” columns (no uuid / numeric tariff fields).
 
-  id, name, street, district, city, postcode, lat, lng,
-  phone, email, website, opening_hours (jsonb), emergency (bool),
-  active (bool), created_at, updated_at, description,
-  emergency_boolean, active_boolean, booking_enabled, supports_mobile,
-  twentyfour_seven, got_min_multiplier, got_max_multiplier,
-  weekend_min_multiplier, notdienst_fee_eur, got_notes,
-  weekend_policy_notes, travel_cost_per_double_km_eur,
-  travel_cost_min_eur, mobile_service_area_km,
-  offers_vaccination, offers_checkup, offers_illness,
-  offers_prescription, offers_dental, auth_user_id, contact_email,
-  onboarding_status, invite_sent_at, last_login_at
-
-Exports:
+Exports (by default):
   out/clinics_berlin.csv
   out/clinics_berlin.jsonl
 """
@@ -41,6 +33,8 @@ from tqdm import tqdm
 # ----------------------------
 
 CITY_DEFAULT = "Berlin"
+
+# Berlin bbox (minlon, minlat, maxlon, maxlat)
 BERLIN_BBOX = (13.08835, 52.33826, 13.76116, 52.67551)
 
 OVERPASS_URLS = [
@@ -55,11 +49,10 @@ EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 
 # ----------------------------
 # Supabase CSV columns
-# EXACTLY matching public.clinics schema
+# (Subset of public.clinics; avoids uuid + numeric fields)
 # ----------------------------
 
 SB_COLUMNS = [
-    "id",
     "name",
     "street",
     "district",
@@ -73,33 +66,19 @@ SB_COLUMNS = [
     "opening_hours",
     "emergency",
     "active",
-    "created_at",
-    "updated_at",
     "description",
     "emergency_boolean",
     "active_boolean",
     "booking_enabled",
     "supports_mobile",
     "twentyfour_seven",
-    "got_min_multiplier",
-    "got_max_multiplier",
-    "weekend_min_multiplier",
-    "notdienst_fee_eur",
-    "got_notes",
-    "weekend_policy_notes",
-    "travel_cost_per_double_km_eur",
-    "travel_cost_min_eur",
-    "mobile_service_area_km",
     "offers_vaccination",
     "offers_checkup",
     "offers_illness",
     "offers_prescription",
     "offers_dental",
-    "auth_user_id",
     "contact_email",
     "onboarding_status",
-    "invite_sent_at",
-    "last_login_at",
 ]
 
 # ----------------------------
@@ -121,6 +100,7 @@ def norm_url(url: str) -> str:
     return u.rstrip("/")
 
 def norm_phone(phone: str) -> str:
+    # Keep digits and leading +
     return re.sub(r"[^\d+]", "", phone or "")[:25]
 
 def http_json_with_retries(
@@ -170,8 +150,8 @@ def looks_247(s: str) -> bool:
 
 EMERGENCY_KWS = ["notdienst", "emergency", "24/7", "24 stunden", "24h", "24 h"]
 
-def derive_emergency(opening_hours: str, name: str, extra_text: str = "") -> bool:
-    blob = " ".join([opening_hours or "", name or "", extra_text or ""]).lower()
+def derive_emergency(opening_hours: str, name: str, extra: str = "") -> bool:
+    blob = " ".join([opening_hours or "", name or "", extra or ""]).lower()
     return any(kw in blob for kw in EMERGENCY_KWS)
 
 def parse_hours_with_opentimeparser(raw_text: str):
@@ -187,7 +167,7 @@ def parse_hours_with_opentimeparser(raw_text: str):
             hours = block.get("hours") or []
             if not hours:
                 for d in days:
-                    segments.append((",".join(days), "off"))
+                    segments.append((", ".join(days), "off"))
             else:
                 for h in hours:
                     fr = (h.get("from") or "").replace(".", ":")
@@ -199,17 +179,14 @@ def parse_hours_with_opentimeparser(raw_text: str):
         return []
 
 def normalize_osm_oh(segments) -> str:
-    parts = []
-    for d, t in segments:
-        parts.append(f"{d} {t}")
-    return "; ".join(parts)
+    return "; ".join(f"{d} {t}" for d, t in segments)
 
 def extract_hours_text_from_html(html: str) -> str:
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         return ""
-    # 1) JSON-LD
+    # JSON-LD first
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             j = json.loads(tag.string or "{}")
@@ -228,7 +205,7 @@ def extract_hours_text_from_html(html: str) -> str:
                         return "; ".join(map(str, oh))
         except Exception:
             pass
-    # 2) Label-based heuristic
+    # Label-based heuristic
     labels = ["öffnungszeiten", "sprechzeiten", "sprechstunde", "opening hours", "hours"]
     blocks = []
     for el in soup.find_all(text=True):
@@ -307,7 +284,7 @@ def derive_service_flags(tags: Dict[str, str], text_blob: str = "") -> Dict[str,
         "dermatologie", "neurologie", "krankheit", "erkrankung", "notfall"
     ])
 
-    # defaults: almost all vets do prescriptions + vaccinations
+    # Defaults: almost all vets do prescriptions + vaccinations
     offers_prescription = True
     offers_vaccination = True
 
@@ -493,9 +470,9 @@ def fill_missing_address(clinics: List[Clinic]) -> List[Clinic]:
     for c in tqdm(clinics):
         if not c.lat or not c.lng:
             continue
-        need_street = not bool(c.street.strip())
-        need_pc = not bool(c.postcode.strip())
-        need_district = not bool(c.district.strip())
+        need_street = not bool((c.street or "").strip())
+        need_pc = not bool((c.postcode or "").strip())
+        need_district = not bool((c.district or "").strip())
         if not (need_street or need_pc or need_district):
             continue
 
@@ -523,8 +500,7 @@ def clinic_to_sb_row(c: Clinic) -> Dict[str, Any]:
     is_247 = looks_247(opening)
     is_emergency = bool(c.emergency_flag) or is_247
 
-    row = {
-        "id": "",  # let DB default gen_random_uuid()
+    return {
         "name": c.name or "",
         "street": c.street or "",
         "district": c.district or "",
@@ -535,38 +511,25 @@ def clinic_to_sb_row(c: Clinic) -> Dict[str, Any]:
         "phone": c.phone or "",
         "email": c.email or "",
         "website": c.website or "",
-        "opening_hours": opening,  # text; DB will store as jsonb string
+        # DB column is jsonb; CSV will send plain text.
+        # If Supabase complains later, we can wrap this with json.dumps().
+        "opening_hours": opening,
         "emergency": bool(is_emergency),
         "active": True,
-        "created_at": "",
-        "updated_at": "",
         "description": "",
         "emergency_boolean": bool(is_emergency),
         "active_boolean": True,
         "booking_enabled": False,
         "supports_mobile": bool(c.supports_mobile),
         "twentyfour_seven": bool(is_247),
-        "got_min_multiplier": "",
-        "got_max_multiplier": "",
-        "weekend_min_multiplier": "",
-        "notdienst_fee_eur": "",
-        "got_notes": "",
-        "weekend_policy_notes": "",
-        "travel_cost_per_double_km_eur": "",
-        "travel_cost_min_eur": "",
-        "mobile_service_area_km": "",
         "offers_vaccination": bool(c.offers_vaccination),
         "offers_checkup": bool(c.offers_checkup),
         "offers_illness": bool(c.offers_illness),
         "offers_prescription": bool(c.offers_prescription),
         "offers_dental": bool(c.offers_dental),
-        "auth_user_id": "",
         "contact_email": c.email or "",
         "onboarding_status": "not_invited",
-        "invite_sent_at": "",
-        "last_login_at": "",
     }
-    return row
 
 def export_supabase_csv(clinics: List[Clinic], out_dir: str, city_slug: str):
     os.makedirs(out_dir, exist_ok=True)
@@ -614,7 +577,7 @@ def main():
         print(f"— Tile {i}/{len(tiles)}")
         all_clinics.extend(fetch_osm_veterinary(tb, args.max_results, city, args.enrich_websites))
 
-    # de-duplicate by (name, lat, lng)
+    # dedupe by (name, lat, lng)
     seen = set()
     uniq: List[Clinic] = []
     for c in all_clinics:

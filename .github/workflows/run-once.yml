@@ -69,21 +69,21 @@ jobs:
           ENRICH: ${{ github.event.inputs.enrich_websites }}
         run: |
           set -e
-          # Defaults depending on mode
+
           if [ "$MODE" = "test" ]; then
             MAX_RESULTS="${MAX_RESULTS:-2000}"
             TILES="${TILES:-2}"
             GEOCODE="${GEOCODE:-false}"
             ENRICH="${ENRICH:-false}"
           else
-            # full
             MAX_RESULTS="${MAX_RESULTS:-5000}"
             TILES="${TILES:-3}"
             GEOCODE="${GEOCODE:-true}"
             ENRICH="${ENRICH:-true}"
           fi
 
-          FLAGS="--city \"Berlin\" --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
+          FLAGS="--city Berlin --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
+
           if [ "$GEOCODE" = "false" ]; then
             FLAGS="$FLAGS --no-geocode"
           fi
@@ -99,17 +99,30 @@ jobs:
           NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p out
           echo "Executing:"
           echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
-          # retry up to 3 times in case Overpass throttles
+
+          success=false
           for i in 1 2 3; do
-            python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }} && break || {
-              echo "Attempt $i failed; backing off..."; sleep $((10 * i));
-            }
+            echo "▶ Attempt $i..."
+            if python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }}; then
+              success=true
+              break
+            else
+              echo "⚠️ Attempt $i failed; backing off..."
+              sleep $((10 * i))
+            fi
           done
-          echo "Run finished."
+
+          if [ "$success" != "true" ]; then
+            echo "❌ All attempts failed, aborting."
+            exit 1
+          fi
+
+          echo "✅ Python run finished."
+          echo "Contents of ./out:"
           ls -la out || true
 
       - name: Upload CSV/JSONL artifacts
@@ -119,4 +132,4 @@ jobs:
           path: |
             out/clinics_berlin.csv
             out/clinics_berlin.jsonl
-          if-no-files-found: warn
+          if-no-files-found: error

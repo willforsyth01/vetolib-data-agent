@@ -27,7 +27,6 @@ from dataclasses import dataclass, asdict
 from typing import Optional, Dict, Any, List, Tuple
 
 import requests
-import pandas as pd
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
@@ -190,7 +189,6 @@ def parse_hours_with_opentimeparser(raw_text: str):
         return []
     try:
         parsed = otp_parse(raw_text or "")
-        # parsed like: [{'days': ['Mo','Tu',...], 'hours': [{'from':'09:00','to':'18:00'}, ...]}]
         segments = []
         for block in parsed:
             days = block.get("days") or []
@@ -437,7 +435,6 @@ def fetch_osm_veterinary(
         phone = norm_phone(tags.get("phone", "") or tags.get("contact:phone", ""))
         email = tags.get("email", "") or tags.get("contact:email", "")
 
-        # Opening hours:
         opening_hours = ""
         raw_oh = (tags.get("opening_hours") or "").strip()
         html = ""  # may be used for enrichment
@@ -466,8 +463,226 @@ def fetch_osm_veterinary(
             (tags.get("name") or "") + " " + (tags.get("description") or "")
         )
 
-        # Service enrichment: OSM tags + small blob of text
         text_blob = " ".join([
             name or "",
             tags.get("description", "") or "",
             tags.get("services", "") or "",
+            opening_hours or "",
+            (html[:800] if html else ""),
+        ])
+        svc_flags = derive_service_flags(tags, text_blob)
+
+        c = Clinic(
+            name=name,
+            website=website,
+            phone=phone,
+            email=email,
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            lat=lat,
+            lon=lon,
+            opening_hours=opening_hours or "",
+            emergency_flag=is_emergency or is_247,
+            supports_mobile=svc_flags["supports_mobile"],
+            offers_checkup=svc_flags["offers_checkup"],
+            offers_dental=svc_flags["offers_dental"],
+            offers_illness=svc_flags["offers_illness"],
+            offers_prescription=svc_flags["offers_prescription"],
+            offers_vaccination=svc_flags["offers_vaccination"],
+        )
+        if c.lat and c.lon and within_bbox(c.lat, c.lon, bbox):
+            clinics.append(c)
+
+    print(f"✅ Found {len(clinics)} candidates from OSM (this tile)")
+    return clinics
+
+def nominatim_reverse(lat: float, lon: float, tries: int = 4, base_delay: float = 1.0) -> Optional[Dict[str, Any]]:
+    delay = base_delay
+    params = {
+        "lat": lat,
+        "lon": lon,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "zoom": 18,
+        "email": EMAIL,
+    }
+    last_err = None
+    for _ in range(tries):
+        time.sleep(1.0)  # polite
+        try:
+            r = requests.get(NOMINATIM_URL + "/reverse", params=params, headers=HEADERS, timeout=30)
+            if r.status_code in (429, 502, 503, 504):
+                last_err = RuntimeError(f"HTTP {r.status_code}")
+                time.sleep(delay)
+                delay = min(delay * 2, 15)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+            delay = min(delay * 2, 15)
+    return None
+
+def fill_missing_address(clinics: List[Clinic], city: str) -> List[Clinic]:
+    print("🧭 Reverse-geocoding missing address parts (Nominatim)…")
+    for c in tqdm(clinics):
+        if not c.lat or not c.lon:
+            continue
+        need_street = not bool((c.street or "").strip())
+        need_hnr = not bool((c.house_number or "").strip())
+        need_pc = not bool((c.postcode or "").strip())
+        if not (need_street or need_hnr or need_pc):
+            continue
+        data = nominatim_reverse(c.lat, c.lon)
+        if not data:
+            continue
+        addr = (data or {}).get("address", {}) or {}
+        if need_street:
+            c.street = addr.get("road") or addr.get("pedestrian") or addr.get("footway") or c.street
+        if need_hnr:
+            c.house_number = addr.get("house_number") or c.house_number
+        if need_pc:
+            pc = addr.get("postcode") or ""
+            m = re.search(r"\b(\d{5})\b", str(pc))
+            if m:
+                c.postcode = m.group(1)
+    return clinics
+
+# ----------------------------
+# Export mapping to Supabase schema
+# ----------------------------
+
+def bool_to_db(v: bool):
+    return bool(v)
+
+def clinic_to_sb_row(c: Clinic) -> dict:
+    opening = c.opening_hours or ""
+    is_247 = looks_247(opening)
+    is_emergency = bool(c.emergency_flag) or is_247
+
+    row = {
+        "name": c.name or "",
+        "website": c.website or "",
+        "phone": c.phone or "",
+        "email": c.email or "",
+        "street": c.street or "",
+        "house_number": c.house_number or "",
+        "postcode": c.postcode or "",
+        "city": c.city or "",
+        "lat": c.lat if c.lat is not None else None,
+        "lng": c.lon if c.lon is not None else None,
+
+        "opening_hours": opening,
+        "emergency": "Notdienst" if is_emergency else "",
+        "emergency_boolean": bool_to_db(is_emergency),
+        "twentyfour_seven": bool_to_db(is_247),
+
+        "supports_mobile": bool_to_db(getattr(c, "supports_mobile", False)),
+        "booking_enabled": bool_to_db(False),
+        "active": bool_to_db(True),
+        "active_boolean": bool_to_db(True),
+
+        "offers_checkup": bool_to_db(getattr(c, "offers_checkup", False)),
+        "offers_dental": bool_to_db(getattr(c, "offers_dental", False)),
+        "offers_illness": bool_to_db(getattr(c, "offers_illness", False)),
+        "offers_prescription": bool_to_db(getattr(c, "offers_prescription", False)),
+        "offers_vaccination": bool_to_db(getattr(c, "offers_vaccination", False)),
+
+        "description": "",
+        "district": "",
+        "onboarding_status": "",
+
+        "created_at": "",
+        "updated_at": "",
+
+        "got_min_multiplier": "",
+        "got_max_multiplier": "",
+        "got_notes": "",
+
+        "weekend_min_multiplier": "",
+        "weekend_policy_notes": "",
+
+        "notdienst_fee_eur": "",
+        "travel_cost_min_eur": "",
+        "travel_cost_per_double_km_eur": "",
+
+        "id": "",
+        "auth_user_id": "",
+        "invite_sent_at": "",
+        "last_login_at": "",
+    }
+    return row
+
+def export_supabase_csv(clinics: list, out_dir: str, city_slug: str):
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"clinics_{city_slug}.csv")
+    jsonl_path = os.path.join(out_dir, f"clinics_{city_slug}.jsonl")
+
+    rows = [clinic_to_sb_row(c) for c in clinics]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=SB_COLUMNS)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({k: r.get(k, "") for k in SB_COLUMNS})
+
+    with open(jsonl_path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps({k: r.get(k, "") for k in SB_COLUMNS}, ensure_ascii=False) + "\n")
+
+    print(f"\n✅ Exported Supabase-layout CSV → {csv_path}")
+    print(f"✅ Exported JSONL → {jsonl_path}\n")
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--city", default=CITY_DEFAULT)
+    parser.add_argument("--max-results", type=int, default=5000)
+    parser.add_argument("--output-dir", default="./out")
+    parser.add_argument("--tiles", type=int, default=2, choices=[1, 2, 3, 4], help="Split bbox into N×N tiles")
+    parser.add_argument("--no-geocode", action="store_true", help="Skip Nominatim reverse for missing address")
+    parser.add_argument("--enrich-websites", action="store_true", help="Visit site to extract opening hours when OSM lacks it")
+    args = parser.parse_args()
+
+    city = args.city
+    city_slug = re.sub(r"[^a-z0-9]+", "-", city.lower()).strip("-") or "city"
+    bbox = BERLIN_BBOX  # this script targets Berlin
+
+    all_clinics: List[Clinic] = []
+
+    tiles = tile_bbox(bbox, args.tiles)
+    print(f"📦 Querying {len(tiles)} tile(s)…")
+    for i, tb in enumerate(tiles, start=1):
+        print(f"— Tile {i}/{len(tiles)}")
+        part = fetch_osm_veterinary(tb, args.max_results, city, enrich_hours_from_site=args.enrich_websites)
+        all_clinics.extend(part)
+
+    # Deduplicate by (name, lat/lon rounded 5)
+    seen = set()
+    uniq: List[Clinic] = []
+    for c in all_clinics:
+        key = (c.name.lower().strip(), round(c.lat or 0, 5), round(c.lon or 0, 5))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+
+    # Optional address backfill
+    if not args.no_geocode:
+        uniq = fill_missing_address(uniq, city)
+
+    # Keep rows with coords inside bbox
+    uniq = [c for c in uniq if c.lat and c.lon and within_bbox(c.lat, c.lon, bbox)]
+
+    print(f"🧹 Final count: {len(uniq)} clinics after merge/dedupe")
+
+    export_supabase_csv(uniq, args.output_dir, city_slug)
+
+if __name__ == "__main__":
+    main()

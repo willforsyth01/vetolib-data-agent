@@ -3,14 +3,16 @@
 
 """
 Vetolib Web Data Agent — Berlin (DE)
+
 - Overpass mirrors + retries + tiling to avoid throttling
 - Optional Nominatim reverse geocode to backfill address bits
 - Heavy opening-hours parsing:
     * prefer OSM opening_hours tag
     * else fetch clinic website (robots-aware) and parse German/English hours
     * normalize to OSM OpeningHours (e.g. "Mo-Fr 09:00-18:00; Sa 10:00-14:00; Su off" or "24/7")
-- Light service enrichment:
+- Service enrichment:
     * infer supports_mobile + offers_* flags from OSM tags + website text
+    * sensible defaults: every vet offers prescriptions + vaccinations
 
 Outputs:
   out/clinics_berlin.csv
@@ -276,7 +278,7 @@ def fetch_site(url: str) -> str:
         parsed = requests.utils.urlparse(url)
         root = f"{parsed.scheme}://{parsed.netloc}"
         robots = requests.get(root + "/robots.txt", timeout=15)
-        if robots.status_code == 200 and "Disallow: /" in robots.text and "User-agent: *" in robots.text:
+        if robots.status_code == 200 and "User-agent: *" in robots.text and "Disallow: /" in robots.text:
             return ""  # respect robots
     except Exception:
         pass
@@ -296,7 +298,10 @@ def fetch_site(url: str) -> str:
 def derive_service_flags(tags: Dict[str, str], text_blob: str = "") -> Dict[str, bool]:
     """
     Infer service flags from OSM tags + free text (name, description, website snippet).
-    Very heuristic, but good enough for light enrichment.
+
+    Strategy:
+    - Default: every vet has prescriptions + vaccinations = True
+    - Keywords refine supports_mobile, checkups, dental, illness
     """
     values = list(tags.values())
     blob = " ".join(values + [text_blob or ""]).lower()
@@ -305,37 +310,48 @@ def derive_service_flags(tags: Dict[str, str], text_blob: str = "") -> Dict[str,
         return any(kw in blob for kw in keywords)
 
     supports_mobile = any_kw([
-        "hausbesuch", "hausbesuche", "hausbesuchen", "mobile tierarzt",
-        "mobile tierärztin", "fahrpraxis", "mobile praxis",
-        "besuch vor ort", "house call", "home visit", "home-visit", "home visit vet"
+        "hausbesuch", "hausbesuche", "hausbesuchen",
+        "mobile tierarzt", "mobile tierärztin", "mobiler tierarzt", "mobile praxis", "fahrpraxis",
+        "besuch vor ort", "home visit", "home-visit", "house call", "house-call", "mobil in berlin"
     ])
 
     offers_vaccination = any_kw([
         "impfung", "impfungen", "impfsprechstunde", "schutzimpfung",
-        "vaccination", "vaccinations", "booster shot"
+        "impfen", "impfen lassen", "welpenimpfung", "katzenimpfung",
+        "tollwutimpfung", "tollwut impfung", "grundimmunisierung",
+        "vaccination", "vaccinations", "vaccinate", "booster shot", "booster vaccine"
     ])
 
     offers_dental = any_kw([
-        "zahn", "zahnheilkunde", "zahnbehandlung", "zahnsteinentfernung",
-        "dental", "dentistry", "zahn-op"
+        "zahn", "zahnheilkunde", "zahnbehandlung", "zahnsteinentfernung", "zahnstein entfernung",
+        "zahn-op", "zahn op", "zahnoperation", "zahnreinigung", "zahnsanierung",
+        "dental", "dentistry", "dental care", "dental treatment"
     ])
 
     offers_checkup = any_kw([
-        "vorsorge", "vorsorgeuntersuchung", "gesundheitscheck",
-        "check-up", "check up", "routineuntersuchung", "jahrescheck"
+        "vorsorge", "vorsorgeuntersuchung", "vorsorge untersuchung",
+        "gesundheitscheck", "gesundheits-check", "check-up", "check up",
+        "routineuntersuchung", "jahrescheck", "jahres-check",
+        "annual check", "annual health check", "wellness exam"
     ])
 
     offers_illness = any_kw([
-        "chirurgie", "operation", "op ", "operationen",
-        "internistik", "innere medizin", "orthopädie",
-        "kardiologie", "onkologie", "dermatologie",
-        "erkrankung", "krankheiten", "behandlung"
+        "chirurgie", "operation", "operationen", "op ", " op,", " op.", "op-saal", "chirurgisch",
+        "internistik", "innere medizin", "orthopädie", "orthopaedie",
+        "kardiologie", "onkologie", "dermatologie", "neurologie",
+        "erkrankung", "krankheiten", "krankheit", "behandlung", "akutsprechstunde",
+        "notfall", "notfälle", "notfallversorgung", "emergency care"
     ])
 
     offers_prescription = any_kw([
-        "medikament", "medikamente", "rezept", "verschreibung",
-        "pharmazie", "pharmacy", "apotheke"
+        "rezept", "rezepte", "rezeptpflichtig", "verschreibung", "verschreibungspflichtig",
+        "medikament", "medikamente", "arznei", "arzneimittel",
+        "pharmazie", "pharmacy", "apotheke", "medication", "prescription", "prescriptions", "prescribed"
     ])
+
+    # Defaults: vets basically always do prescriptions + vaccinations
+    offers_prescription = True if not offers_prescription else True
+    offers_vaccination = True if not offers_vaccination else True
 
     return {
         "supports_mobile": supports_mobile,
@@ -369,8 +385,8 @@ class Clinic:
     offers_checkup: bool = False
     offers_dental: bool = False
     offers_illness: bool = False
-    offers_prescription: bool = False
-    offers_vaccination: bool = False
+    offers_prescription: bool = True     # default True
+    offers_vaccination: bool = True      # default True
 
     def as_dict(self):
         return asdict(self)
@@ -435,26 +451,28 @@ def fetch_osm_veterinary(
         phone = norm_phone(tags.get("phone", "") or tags.get("contact:phone", ""))
         email = tags.get("email", "") or tags.get("contact:email", "")
 
+        # OSM opening hours first
         opening_hours = ""
         raw_oh = (tags.get("opening_hours") or "").strip()
-        html = ""  # may be used for enrichment
-
         if looks_247(raw_oh):
             opening_hours = "24/7"
         elif raw_oh:
             segs = parse_hours_with_opentimeparser(raw_oh)
             opening_hours = normalize_osm_oh(segs) if segs else raw_oh
 
-        # If missing, optionally try website
-        if not opening_hours and enrich_hours_from_site and website:
+        # Website HTML (for enrichment, always when enabled)
+        html = ""
+        if enrich_hours_from_site and website:
             html = fetch_site(website)
-            if html:
-                candidate = extract_hours_text_from_html(html)
-                if looks_247(candidate):
-                    opening_hours = "24/7"
-                else:
-                    segs = parse_hours_with_opentimeparser(candidate)
-                    opening_hours = normalize_osm_oh(segs) if segs else (candidate[:200] if candidate else "")
+
+        # If opening_hours still missing, try to derive from website HTML
+        if not opening_hours and html:
+            candidate = extract_hours_text_from_html(html)
+            if looks_247(candidate):
+                opening_hours = "24/7"
+            else:
+                segs = parse_hours_with_opentimeparser(candidate)
+                opening_hours = normalize_osm_oh(segs) if segs else (candidate[:200] if candidate else "")
 
         is_247 = looks_247(opening_hours)
         is_emergency = derive_emergency(
@@ -463,12 +481,13 @@ def fetch_osm_veterinary(
             (tags.get("name") or "") + " " + (tags.get("description") or "")
         )
 
+        # Service enrichment: OSM tags + text from OSM + website HTML (if present)
         text_blob = " ".join([
             name or "",
             tags.get("description", "") or "",
             tags.get("services", "") or "",
             opening_hours or "",
-            (html[:800] if html else ""),
+            (html[:2000] if html else ""),   # enough context, avoid huge blobs
         ])
         svc_flags = derive_service_flags(tags, text_blob)
 
@@ -588,8 +607,8 @@ def clinic_to_sb_row(c: Clinic) -> dict:
         "offers_checkup": bool_to_db(getattr(c, "offers_checkup", False)),
         "offers_dental": bool_to_db(getattr(c, "offers_dental", False)),
         "offers_illness": bool_to_db(getattr(c, "offers_illness", False)),
-        "offers_prescription": bool_to_db(getattr(c, "offers_prescription", False)),
-        "offers_vaccination": bool_to_db(getattr(c, "offers_vaccination", False)),
+        "offers_prescription": bool_to_db(getattr(c, "offers_prescription", True)),
+        "offers_vaccination": bool_to_db(getattr(c, "offers_vaccination", True)),
 
         "description": "",
         "district": "",
@@ -647,7 +666,7 @@ def main():
     parser.add_argument("--output-dir", default="./out")
     parser.add_argument("--tiles", type=int, default=2, choices=[1, 2, 3, 4], help="Split bbox into N×N tiles")
     parser.add_argument("--no-geocode", action="store_true", help="Skip Nominatim reverse for missing address")
-    parser.add_argument("--enrich-websites", action="store_true", help="Visit site to extract opening hours when OSM lacks it")
+    parser.add_argument("--enrich-websites", action="store_true", help="Visit site to extract opening hours + enrich services")
     args = parser.parse_args()
 
     city = args.city

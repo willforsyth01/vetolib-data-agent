@@ -97,6 +97,7 @@ jobs:
       - name: Run Vetolib crawler
         env:
           NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail

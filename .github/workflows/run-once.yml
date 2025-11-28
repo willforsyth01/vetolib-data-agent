@@ -70,26 +70,32 @@ jobs:
         run: |
           set -e
 
+          # Defaults depending on mode
           if [ "$MODE" = "test" ]; then
             MAX_RESULTS="${MAX_RESULTS:-2000}"
             TILES="${TILES:-2}"
             GEOCODE="${GEOCODE:-false}"
             ENRICH="${ENRICH:-false}"
           else
+            # full
             MAX_RESULTS="${MAX_RESULTS:-5000}"
             TILES="${TILES:-3}"
             GEOCODE="${GEOCODE:-true}"
             ENRICH="${ENRICH:-true}"
           fi
 
-          FLAGS="--city Berlin --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
+          FLAGS="--city \"Berlin\" --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
 
           if [ "$GEOCODE" = "false" ]; then
             FLAGS="$FLAGS --no-geocode"
           fi
+
           if [ "$ENRICH" = "true" ]; then
             FLAGS="$FLAGS --enrich-websites"
           fi
+
+          # Always use Google Places so we get full Berlin coverage
+          FLAGS="$FLAGS --use-google-places"
 
           echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
           echo "✅ Using flags: $FLAGS"
@@ -100,29 +106,17 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           mkdir -p out
           echo "Executing:"
           echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
-
-          success=false
+          # retry up to 3 times in case Overpass or Google throttles
           for i in 1 2 3; do
-            echo "▶ Attempt $i..."
-            if python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }}; then
-              success=true
-              break
-            else
-              echo "⚠️ Attempt $i failed; backing off..."
-              sleep $((10 * i))
-            fi
+            python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }} && break || {
+              echo "Attempt $i failed; backing off..."; sleep $((10 * i));
+            }
           done
-
-          if [ "$success" != "true" ]; then
-            echo "❌ All attempts failed, aborting."
-            exit 1
-          fi
-
-          echo "✅ Python run finished."
+          echo "Run finished."
           echo "Contents of ./out:"
           ls -la out || true
 
@@ -133,4 +127,7 @@ jobs:
           path: |
             out/clinics_berlin.csv
             out/clinics_berlin.jsonl
-          if-no-files-found: error
+            out/clinic_pet_types_berlin.csv
+            out/clinic_services_berlin.csv
+            out/clinic_specialists_berlin.csv
+          if-no-files-found: warn

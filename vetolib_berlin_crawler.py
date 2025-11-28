@@ -59,7 +59,7 @@ OVERPASS_URLS = [
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-HEADERS = {"User-Agent": "Vetolib-Agent/1.4 (+https://vetolib.app)"}
+HEADERS = {"User-Agent": "Vetolib-Agent/1.5 (+https://vetolib.app)"}
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
@@ -211,28 +211,12 @@ def derive_emergency(opening_hours: str, name: str, extra: str = "") -> bool:
     return any(kw in blob for kw in EMERGENCY_KWS)
 
 def parse_hours_with_opentimeparser(raw_text: str):
-    try:
-        from opentimeparser import parse as otp_parse
-    except Exception:
-        return []
-    try:
-        parsed = otp_parse(raw_text or "")
-        segments = []
-        for block in parsed:
-            days = block.get("days") or []
-            hours = block.get("hours") or []
-            if not hours:
-                for _d in days:
-                    segments.append((",".join(days), "off"))
-            else:
-                for h in hours:
-                    fr = (h.get("from") or "").replace(".", ":")
-                    to = (h.get("to") or "").replace(".", ":")
-                    if fr and to:
-                        segments.append((",".join(days), f"{fr}-{to}"))
-        return segments
-    except Exception:
-        return []
+    """
+    Placeholder parser: currently we don't normalize hours via opentimeparser,
+    we just keep the raw opening_hours string from OSM / Google / website.
+    This returns an empty list so callers fall back to the original text.
+    """
+    return []
 
 def normalize_osm_oh(segments) -> str:
     return "; ".join(f"{d} {t}" for d, t in segments)
@@ -342,7 +326,7 @@ SPECIALIST_MAP = {
     "behavior": ["verhaltenstherapie", "verhalten", "behavior", "training"],
     "nutrition": ["ernährungsberatung", "ernährung", "nutrition", "diet"],
     "imaging": ["röntgen", "roentgen", "x-ray", "ultraschall", "ultrasound", "ct", "mrt", "mri"],
-    "surgery": ["chirurgie", "operation", "operativ", "chirurgisch", "op "],
+    "surgery": ["chirurgie", "operation", "operativ", "chirurg", "op "],
     "exotics": ["exoten", "exotenmedizin", "exotic"],
 }
 
@@ -497,7 +481,7 @@ def overpass_query(bbox: Tuple[float,float,float,float], max_results: int) -> Li
     (
       node["amenity"="veterinary"]({minlat},{minlon},{maxlat},{maxlon});
       way["amenity"="veterinary"]({minlat},{minlon},{maxlat},{maxlon});
-      relation["amenity"="veterinary"]({minlat},{minlon},{maxlat},{maxlat});
+      relation["amenity"="veterinary"]({minlat},{minlon},{maxlat},{maxlon});
     );
     out center {max_results};
     """.strip()
@@ -634,8 +618,41 @@ def google_nearby_for_tile(center_lat: float, center_lng: float, api_key: str) -
         if page_token:
             local_params["pagetoken"] = page_token
             time.sleep(2.1)
-        data = http_json_with_retries("GET", url, params=local_params, headers=HEADERS, timeout=40, tries=4, polite_delay=1.5)
-        results.extend(data.get("results", []))
+        data = http_json_with_retries(
+            "GET", url, params=local_params,
+            headers=HEADERS, timeout=40, tries=4, polite_delay=1.5
+        )
+        batch = data.get("results", [])
+        results.extend(batch)
+        page_token = data.get("next_page_token")
+        if not page_token:
+            break
+    return results
+
+def google_text_search_for_city(query: str, api_key: str) -> List[Dict[str, Any]]:
+    """
+    Use Places Text Search to find clinics by keyword, e.g. 'Tierarzt Berlin'.
+    We still later filter to veterinary_care-type results.
+    """
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {
+        "query": query,
+        "region": "de",
+        "key": api_key,
+    }
+    results = []
+    page_token = None
+    for _ in range(5):
+        local_params = params.copy()
+        if page_token:
+            local_params["pagetoken"] = page_token
+            time.sleep(2.1)
+        data = http_json_with_retries(
+            "GET", url, params=local_params,
+            headers=HEADERS, timeout=40, tries=4, polite_delay=1.5
+        )
+        batch = data.get("results", [])
+        results.extend(batch)
         page_token = data.get("next_page_token")
         if not page_token:
             break
@@ -649,30 +666,57 @@ def google_fetch_all_places(bbox: Tuple[float,float,float,float], tiles_per_side
     tiles = tile_bbox(bbox, tiles_per_side)
     places_by_id: Dict[str, Dict[str, Any]] = {}
 
-    print("🔎 Fetching clinics from Google Places…")
+    print("🔎 Fetching clinics from Google Places (Nearby Search)…")
     for i, tb in enumerate(tiles, start=1):
         minlon, minlat, maxlon, maxlat = tb
         center_lat = (minlat + maxlat) / 2.0
         center_lng = (minlon + maxlon) / 2.0
-        print(f"  • Tile {i}/{len(tiles)} (center {center_lat:.5f},{center_lng:.5f})")
+        print(f"  • Nearby tile {i}/{len(tiles)} (center {center_lat:.5f},{center_lng:.5f})")
         try:
             results = google_nearby_for_tile(center_lat, center_lng, api_key)
             for r in results:
                 pid = r.get("place_id")
                 if not pid:
                     continue
+                types = r.get("types", []) or []
+                if "veterinary_care" not in types:
+                    continue
                 if pid not in places_by_id:
                     places_by_id[pid] = r
         except Exception as e:
-            print(f"    ⚠️ Google tile {i} failed: {e}")
+            print(f"    ⚠️ Google Nearby tile {i} failed: {e}")
             continue
 
-    print(f"✅ Unique Google Places (nearby) found: {len(places_by_id)}")
+    print("🔎 Fetching clinics from Google Places (Text Search)…")
+    text_queries = [
+        "Tierarzt Berlin",
+        "Tierärztliche Klinik Berlin",
+        "Tierarztpraxis Berlin",
+        "Tierklinik Berlin",
+    ]
+    for q in text_queries:
+        print(f"  • Text search: {q!r}")
+        try:
+            results = google_text_search_for_city(q, api_key)
+            for r in results:
+                pid = r.get("place_id")
+                if not pid:
+                    continue
+                types = r.get("types", []) or []
+                if "veterinary_care" not in types:
+                    continue
+                if pid not in places_by_id:
+                    places_by_id[pid] = r
+        except Exception as e:
+            print(f"    ⚠️ Text search {q!r} failed: {e}")
+            continue
+
+    print(f"✅ Unique Google Places (veterinary_care) found: {len(places_by_id)}")
     return places_by_id
 
 def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key: str, city_fallback: str) -> Optional[Clinic]:
     url = "https://maps.googleapis.com/maps/api/place/details/json"
-    fields = "name,formatted_address,address_components,formatted_phone_number,geometry,website,opening_hours"
+    fields = "name,formatted_address,address_components,formatted_phone_number,geometry,website,opening_hours,types"
     params = {"place_id": place_id, "fields": fields, "key": api_key}
 
     try:
@@ -730,8 +774,8 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     is_247 = looks_247(opening_hours)
     is_emergency = derive_emergency(opening_hours, name, "")
 
-    types = basic.get("types", []) or result.get("types", []) or []
-    blob = " ".join([name] + types + [opening_hours or ""])
+    types_all = basic.get("types", []) or result.get("types", []) or []
+    blob = " ".join([name] + types_all + [opening_hours or ""])
 
     pet_types = detect_pet_types(blob)
     specialists = detect_specialists(blob)
@@ -873,7 +917,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
         if best_idx is not None:
             o = merged[best_idx]
-            # Name: trust Google (Option D) unless OSM clearly better (we keep Google here)
+            # Name: trust Google (Option D)
             o.name = g.name or o.name
 
             # Prefer Google contact if missing
@@ -920,6 +964,14 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
     is_247 = looks_247(opening)
     is_emergency = bool(c.emergency_flag) or is_247
 
+    # JSON object for jsonb column: keeps raw string + useful flags
+    opening_obj = {
+        "raw": opening,
+        "is_247": is_247,
+        "emergency": is_emergency,
+        "source": c.source,
+    }
+
     return {
         "name": c.name or "",
         "street": c.street or "",
@@ -931,9 +983,7 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
         "phone": c.phone or "",
         "email": c.email or "",
         "website": c.website or "",
-        # NOTE: opening_hours is jsonb in DB; CSV import will need to cast.
-        # For now we store as plain text; can be wrapped to JSON on import.
-        "opening_hours": opening,
+        "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
         "emergency": bool(is_emergency),
         "active": True,
         "description": "",

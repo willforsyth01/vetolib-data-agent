@@ -8,18 +8,22 @@ on:
         type: choice
         options: [test, full]
         default: test
+
       max_results:
         description: "Overpass max results per tile"
         type: number
         default: 2000
+
       tiles:
         description: "Split Berlin bbox into N×N tiles"
         type: number
         default: 2
+
       geocode:
         description: "Use Nominatim reverse geocoding (slower)"
         type: boolean
         default: false
+
       enrich_websites:
         description: "Fetch clinic websites to parse opening hours"
         type: boolean
@@ -40,94 +44,4 @@ jobs:
         shell: bash
         run: |
           set -e
-          CRAWLER="$(git ls-files | grep -E '(^|/|\\)vetolib_berlin_crawler\.py$' | head -n 1 || true)"
-          REQS="$(git ls-files | grep -E '(^|/|\\)requirements\.txt$' | head -n 1 || true)"
-          test -n "$CRAWLER" || { echo "❌ Missing vetolib_berlin_crawler.py"; exit 1; }
-          test -n "$REQS" || { echo "❌ Missing requirements.txt"; exit 1; }
-          echo "crawler=$CRAWLER" >> "$GITHUB_OUTPUT"
-          echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
-          echo "✅ Found: $CRAWLER and $REQS"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r "${{ steps.locate.outputs.reqs }}"
-
-      - name: Build command from inputs
-        id: cmd
-        shell: bash
-        env:
-          MODE: ${{ github.event.inputs.mode }}
-          MAX_RESULTS: ${{ github.event.inputs.max_results }}
-          TILES: ${{ github.event.inputs.tiles }}
-          GEOCODE: ${{ github.event.inputs.geocode }}
-          ENRICH: ${{ github.event.inputs.enrich_websites }}
-        run: |
-          set -e
-
-          # Defaults depending on mode
-          if [ "$MODE" = "test" ]; then
-            MAX_RESULTS="${MAX_RESULTS:-2000}"
-            TILES="${TILES:-2}"
-            GEOCODE="${GEOCODE:-false}"
-            ENRICH="${ENRICH:-false}"
-          else
-            # full
-            MAX_RESULTS="${MAX_RESULTS:-5000}"
-            TILES="${TILES:-3}"
-            GEOCODE="${GEOCODE:-true}"
-            ENRICH="${ENRICH:-true}"
-          fi
-
-          FLAGS="--city \"Berlin\" --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
-
-          if [ "$GEOCODE" = "false" ]; then
-            FLAGS="$FLAGS --no-geocode"
-          fi
-
-          if [ "$ENRICH" = "true" ]; then
-            FLAGS="$FLAGS --enrich-websites"
-          fi
-
-          # Always use Google Places so we get full Berlin coverage
-          FLAGS="$FLAGS --use-google-places"
-
-          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
-          echo "✅ Using flags: $FLAGS"
-
-      - name: Run Vetolib crawler
-        env:
-          NOMINATIM_EMAIL: ${{ secrets.NOMINATIM_EMAIL }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        shell: bash
-        run: |
-          set -e
-          mkdir -p out
-          echo "Executing:"
-          echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
-          # retry up to 3 times in case Overpass or Google throttles
-          for i in 1 2 3; do
-            python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }} && break || {
-              echo "Attempt $i failed; backing off..."; sleep $((10 * i));
-            }
-          done
-          echo "Run finished."
-          echo "Contents of ./out:"
-          ls -la out || true
-
-      - name: Upload CSV/JSONL artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: vetolib-berlin-${{ github.event.inputs.mode || 'test' }}
-          path: |
-            out/clinics_berlin.csv
-            out/clinics_berlin.jsonl
-            out/clinic_pet_types_berlin.csv
-            out/clinic_services_berlin.csv
-            out/clinic_specialists_berlin.csv
-          if-no-files-found: warn
+          C

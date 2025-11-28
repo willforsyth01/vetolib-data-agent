@@ -964,7 +964,9 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
     is_247 = looks_247(opening)
     is_emergency = bool(c.emergency_flag) or is_247
 
-    # JSON object for jsonb column: keeps raw string + useful flags
+    # JSON object for jsonb column: keeps raw string + useful flags.
+    # Example cell in CSV:
+    # {"raw":"Mo-Fr 09:00-18:00; Sa 10:00-14:00","is_247":false,"emergency":false,"source":"google"}
     opening_obj = {
         "raw": opening,
         "is_247": is_247,

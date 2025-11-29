@@ -210,11 +210,10 @@ def derive_emergency(opening_hours: str, name: str, extra: str = "") -> bool:
     blob = " ".join([opening_hours or "", name or "", extra or ""]).lower()
     return any(kw in blob for kw in EMERGENCY_KWS)
 
+# We no longer use opentimeparser, but keep this placeholder for future improvements
 def parse_hours_with_opentimeparser(raw_text: str):
     """
-    Placeholder parser: currently we don't normalize hours via opentimeparser,
-    we just keep the raw opening_hours string from OSM / Google / website.
-    This returns an empty list so callers fall back to the original text.
+    Placeholder parser: currently we don't normalize hours via opentimeparser.
     """
     return []
 
@@ -293,6 +292,187 @@ def fetch_site(url: str) -> str:
     except Exception:
         return ""
     return ""
+
+# --- NEW: day + time parsing for structured JSON ---
+
+DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+DAY_ALIASES = {
+    "monday": "mon", "mon": "mon", "montag": "mon", "mo": "mon",
+    "tuesday": "tue", "tue": "tue", "dienstag": "tue", "di": "tue",
+    "wednesday": "wed", "wed": "wed", "mittwoch": "wed", "mi": "wed",
+    "thursday": "thu", "thu": "thu", "donnerstag": "thu", "do": "thu",
+    "friday": "fri", "fri": "fri", "freitag": "fri", "fr": "fri",
+    "saturday": "sat", "sat": "sat", "samstag": "sat", "sa": "sat",
+    "sunday": "sun", "sun": "sun", "sonntag": "sun", "so": "sun",
+}
+
+def canonical_day(label: str) -> Optional[str]:
+    if not label:
+        return None
+    key = label.strip().lower()
+    return DAY_ALIASES.get(key)
+
+def parse_time_token(token: str) -> Optional[float]:
+    """
+    Parse a time token like '9:00', '09:30', '9 AM', '6:30PM', '18'.
+    Returns decimal hours (e.g. 9.0, 18.5).
+    """
+    if not token:
+        return None
+    t = token.strip().lower()
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    ampm = m.group(3)
+
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    if hour > 24:
+        return None
+    return hour + minute / 60.0
+
+def parse_time_range(range_str: str) -> Optional[Tuple[float, float]]:
+    """
+    Parse a range like '9:00-18:00', '9:00 – 18:00', '9 AM – 6 PM'.
+    """
+    if not range_str:
+        return None
+    # Split on common separators
+    parts = re.split(r"\s*[–\-–]\s*|\s+to\s+", range_str, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    start = parse_time_token(parts[0])
+    end = parse_time_token(parts[1])
+    if start is None or end is None:
+        return None
+    return (start, end)
+
+def parse_opening_hours_struct(raw: str) -> Dict[str, List[List[float]]]:
+    """
+    Best-effort parser to build:
+      { "mon": [[9, 18]], "tue": [[9, 12], [14, 18]], ... }
+    Works best on:
+    - Google weekday_text lines joined with '; '
+    - Simple OSM-like lines: 'Mo-Fr 09:00-18:00; Sa 10:00-14:00'
+    """
+    struct = {d: [] for d in DAY_KEYS}
+    if not raw:
+        return struct
+
+    text = raw.strip()
+    # Split lines by ';'
+    lines = re.split(r";\s*", text)
+
+    for line in lines:
+        if not line:
+            continue
+        l = line.strip()
+        # If explicitly closed
+        if any(kw in l.lower() for kw in ["geschlossen", "closed"]):
+            # we keep [] for that day
+            pass
+
+        # Try Google style: "Monday: 9:00 AM – 6:00 PM"
+        if ":" in l:
+            before, after = l.split(":", 1)
+            day_label = before.strip()
+            day_key = canonical_day(day_label)
+            if not day_key:
+                # Could be "Mon-Fri: 9-18" etc → fall through to generic
+                pass
+            else:
+                # After part: "9:00 AM – 6:00 PM" or "Closed"
+                if any(kw in after.lower() for kw in ["closed", "geschlossen"]):
+                    continue
+                # Split multiple intervals by commas
+                ranges = re.split(r",\s*", after)
+                for r in ranges:
+                    tr = parse_time_range(r)
+                    if tr:
+                        start, end = tr
+                        struct[day_key].append([start, end])
+                continue  # handled
+
+        # Try OSM-like: "Mo-Fr 09:00-18:00", "Sa 10:00-14:00"
+        m = re.match(r"^\s*([A-Za-zÄÖÜäöü,.\-\s]+)\s+([0-9:.\sAPMapm–\-to]+)\s*$", l)
+        if not m:
+            continue
+        days_part = m.group(1)
+        times_part = m.group(2)
+
+        # Parse days: handle ranges "Mo-Fr" and lists "Mo,Tu,We"
+        day_tokens = re.split(r",\s*", days_part.strip())
+        day_list: List[str] = []
+        for dt in day_tokens:
+            dt = dt.strip()
+            if "-" in dt:
+                left, right = [x.strip() for x in re.split(r"\s*-\s*", dt)]
+                left_key = canonical_day(left)
+                right_key = canonical_day(right)
+                if left_key and right_key:
+                    start_idx = DAY_KEYS.index(left_key)
+                    end_idx = DAY_KEYS.index(right_key)
+                    if start_idx <= end_idx:
+                        day_list.extend(DAY_KEYS[start_idx:end_idx+1])
+            else:
+                dk = canonical_day(dt)
+                if dk:
+                    day_list.append(dk)
+
+        if not day_list:
+            continue
+
+        # Parse times
+        time_ranges = re.split(r",\s*", times_part.strip())
+        parsed_ranges: List[Tuple[float, float]] = []
+        for tr in time_ranges:
+            pr = parse_time_range(tr)
+            if pr:
+                parsed_ranges.append(pr)
+
+        for d in day_list:
+            for (start, end) in parsed_ranges:
+                struct[d].append([start, end])
+
+    return struct
+
+def build_opening_hours_json(raw: str, source: str, emergency_flag: bool) -> Dict[str, Any]:
+    """
+    Build the final JSON object for the jsonb column:
+      {
+        "raw": "...",
+        "structured": { "mon": [[9,18]], ... },
+        "is_247": true/false,
+        "emergency": true/false,
+        "source": "osm"/"google"
+      }
+    """
+    raw = raw or ""
+    is_247 = looks_247(raw)
+    structured = {d: [] for d in DAY_KEYS}
+
+    if is_247:
+        # Represent 24/7 as 0–24 each day
+        for d in DAY_KEYS:
+            structured[d] = [[0.0, 24.0]]
+    elif raw:
+        structured = parse_opening_hours_struct(raw)
+
+    is_emergency = bool(emergency_flag) or is_247
+
+    return {
+        "raw": raw,
+        "structured": structured,
+        "is_247": is_247,
+        "emergency": is_emergency,
+        "source": source,
+    }
 
 # ----------------------------
 # Pet types & specialist detection
@@ -769,6 +949,7 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     oh = result.get("opening_hours") or {}
     weekday_text = oh.get("weekday_text")
     if isinstance(weekday_text, list) and weekday_text:
+        # Join with '; ' so parse_opening_hours_struct can split lines
         opening_hours = "; ".join(weekday_text)
 
     is_247 = looks_247(opening_hours)
@@ -961,18 +1142,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
 def clinic_to_row(c: Clinic) -> Dict[str, Any]:
     opening = c.opening_hours or ""
-    is_247 = looks_247(opening)
-    is_emergency = bool(c.emergency_flag) or is_247
-
-    # JSON object for jsonb column: keeps raw string + useful flags.
-    # Example cell in CSV:
-    # {"raw":"Mo-Fr 09:00-18:00; Sa 10:00-14:00","is_247":false,"emergency":false,"source":"google"}
-    opening_obj = {
-        "raw": opening,
-        "is_247": is_247,
-        "emergency": is_emergency,
-        "source": c.source,
-    }
+    opening_obj = build_opening_hours_json(opening, c.source, c.emergency_flag)
 
     return {
         "name": c.name or "",
@@ -985,15 +1155,16 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
         "phone": c.phone or "",
         "email": c.email or "",
         "website": c.website or "",
+        # JSON as string for CSV; Supabase jsonb will parse it
         "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
-        "emergency": bool(is_emergency),
+        "emergency": bool(opening_obj["emergency"]),
         "active": True,
         "description": "",
-        "emergency_boolean": bool(is_emergency),
+        "emergency_boolean": bool(opening_obj["emergency"]),
         "active_boolean": True,
         "booking_enabled": False,
         "supports_mobile": bool(c.supports_mobile),
-        "twentyfour_seven": bool(is_247),
+        "twentyfour_seven": bool(opening_obj["is_247"]),
         "offers_vaccination": True,
         "offers_checkup": True,
         "offers_illness": True,

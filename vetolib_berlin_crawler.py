@@ -59,7 +59,7 @@ OVERPASS_URLS = [
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-HEADERS = {"User-Agent": "Vetolib-Agent/1.5 (+https://vetolib.app)"}
+HEADERS = {"User-Agent": "Vetolib-Agent/1.6 (+https://vetolib.app)"}
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
@@ -128,12 +128,12 @@ CLINIC_SPECIALISTS_COLUMNS = [
 ]
 
 # ----------------------------
-# Helpers
+# Helpers (general)
 # ----------------------------
 
 def within_bbox(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> bool:
     minlon, minlat, maxlon, maxlat = bbox
-    return (minlat <= lat <= maxlat) and (minlon <= lon <= maxlon)
+    return (minlat <= lat <= maxlat) and (minlon <= lon <= maxlat)
 
 def norm_url(url: str) -> str:
     if not url:
@@ -197,56 +197,237 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return R * c
 
 # ----------------------------
-# Opening-hours helpers
+# Opening-hours + emergency helpers (MAX parser)
 # ----------------------------
+
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+DAY_ALIASES = {
+    "mo": "mon", "mon": "mon", "monday": "mon", "montag": "mon",
+    "tu": "tue", "tue": "tue", "tues": "tue", "tuesday": "tue", "dienstag": "tue",
+    "we": "wed", "wed": "wed", "weds": "wed", "wednesday": "wed", "mittwoch": "wed",
+    "th": "thu", "thu": "thu", "thur": "thu", "thurs": "thu",
+    "thursday": "thu", "donnerstag": "thu",
+    "fr": "fri", "fri": "fri", "friday": "fri", "freitag": "fri",
+    "sa": "sat", "sat": "sat", "saturday": "sat", "samstag": "sat",
+    "su": "sun", "sun": "sun", "sunday": "sun", "sonntag": "sun",
+}
+
+SPECIAL_DAY_WORDS = {
+    "täglich": DAYS,
+    "taeglich": DAYS,
+    "daily": DAYS,
+    "werktags": ["mon", "tue", "wed", "thu", "fri"],
+    "wochentags": ["mon", "tue", "wed", "thu", "fri"],
+}
+
+EMERGENCY_KWS = [
+    "notdienst",
+    "notfall",
+    "notfälle",
+    "emergency",
+    "tierärztlicher notdienst",
+    "tierarzt notdienst",
+    "24h",
+    "24 h",
+    "24/7",
+    "24-stunden",
+    "24 stunden",
+    "rund um die uhr",
+    "nacht",
+    "nachts",
+    "tierklinik",
+    "klinik",
+]
 
 def looks_247(s: str) -> bool:
     s = (s or "").lower()
-    return any(k in s for k in ["24/7", "24h", "24 h", "24 stunden", "rund um die uhr"])
+    return any(k in s for k in ["24/7", "24 h", "24h", "rund um die uhr"])
 
-EMERGENCY_KWS = ["notdienst", "emergency", "24/7", "24 stunden", "24h", "24 h"]
-
-def derive_emergency(opening_hours: str, name: str, extra: str = "") -> bool:
-    blob = " ".join([opening_hours or "", name or "", extra or ""]).lower()
-    return any(kw in blob for kw in EMERGENCY_KWS)
-
-# We no longer use opentimeparser, but keep this placeholder for future improvements
-def parse_hours_with_opentimeparser(raw_text: str):
-    """
-    Placeholder parser: currently we don't normalize hours via opentimeparser.
-    """
+def parse_day_token(token: str) -> List[str]:
+    t = token.strip().lower().rstrip(".")
+    if not t:
+        return []
+    if t in SPECIAL_DAY_WORDS:
+        return SPECIAL_DAY_WORDS[t]
+    if "-" in t:
+        a, b = [x.strip() for x in t.split("-", 1)]
+        a = DAY_ALIASES.get(a, None)
+        b = DAY_ALIASES.get(b, None)
+        if not a or not b:
+            return []
+        ai = DAYS.index(a)
+        bi = DAYS.index(b)
+        if ai <= bi:
+            return DAYS[ai : bi + 1]
+        return DAYS[ai:] + DAYS[: bi + 1]
+    if t in DAY_ALIASES:
+        return [DAY_ALIASES[t]]
     return []
 
-def normalize_osm_oh(segments) -> str:
-    return "; ".join(f"{d} {t}" for d, t in segments)
+def parse_days_expr(expr: str) -> List[str]:
+    parts = re.split(r"[,\s]+", expr)
+    days: List[str] = []
+    for p in parts:
+        if not p:
+            continue
+        days.extend(parse_day_token(p))
+    # dedupe, preserve order
+    seen = set()
+    ordered = []
+    for d in days:
+        if d not in seen:
+            seen.add(d)
+            ordered.append(d)
+    return ordered
+
+def parse_time_ranges(expr: str) -> List[List[float]]:
+    expr = expr.replace("–", "-").replace("—", "-")
+    ranges: List[List[float]] = []
+    # e.g. 09:00-13:00,14:00-18:00
+    for m in re.finditer(
+        r"(\d{1,2})(?::|\.|h)?(\d{2})?\s*-\s*(\d{1,2})(?::|\.|h)?(\d{2})?",
+        expr,
+    ):
+        h1, m1, h2, m2 = m.groups()
+        m1 = m1 or "00"
+        m2 = m2 or "00"
+        start = int(h1) + int(m1) / 60.0
+        end = int(h2) + int(m2) / 60.0
+        if end == 0:
+            end = 24.0
+        if 0 <= start < 24 and 0 < end <= 24 and end > start:
+            ranges.append([round(start, 2), round(end, 2)])
+    return ranges
+
+def parse_opening_hours_to_struct(raw: str) -> Dict[str, List[List[float]]]:
+    """
+    Maximum parser (heuristic) for:
+      - OSM style: "Mo-Fr 09:00-18:00; Sa 10:00-14:00"
+      - Mixed: "Mo-Sa 10:00-12:00, Mo 17:00-19:00, Tu,We,Fr 16:00-18:00, Th 17:00-19:00"
+      - Google style: "Monday: 09:00–18:00; Tuesday: 09:00–18:00"
+    """
+    res: Dict[str, List[List[float]]] = {d: [] for d in DAYS}
+    if not raw or not isinstance(raw, str):
+        return res
+
+    txt = raw.strip()
+    low = txt.lower()
+
+    # 24/7 detection
+    if any(k in low for k in ["24/7", "24 h", "24h", "rund um die uhr"]):
+        for d in DAYS:
+            res[d] = [[0.0, 24.0]]
+        return res
+
+    # Normalise
+    txt = txt.replace("\n", "; ")
+    txt = txt.replace("–", "-").replace("—", "-")
+    txt = re.sub(r"\s+", " ", txt)
+
+    # Pattern for: "Mo-Fr 09:00-18:00,14:00-18:00" and "Monday: 09:00-18:00"
+    pattern = re.compile(
+        r"(?P<days>(?:[A-Za-zÄÖÜäöü\.]{2,}(?:\s*[-,]\s*)?)+)\s*[: ]\s*"
+        r"(?P<times>\d{1,2}[:\.h]?\d{0,2}\s*-\s*\d{1,2}[:\.h]?\d{0,2}"
+        r"(?:\s*,\s*\d{1,2}[:\.h]?\d{0,2}\s*-\s*\d{1,2}[:\.h]?\d{0,2})*)"
+    )
+
+    for m in pattern.finditer(txt):
+        days_expr = m.group("days")
+        times_expr = m.group("times")
+        days = parse_days_expr(days_expr)
+        ranges = parse_time_ranges(times_expr)
+        if not days or not ranges:
+            continue
+        for d in days:
+            res[d].extend(ranges)
+
+    return res
+
+def infer_is_247(opening_raw: str, struct: Dict[str, List[List[float]]]) -> bool:
+    low = (opening_raw or "").lower()
+    if any(k in low for k in ["24/7", "24 h", "24h", "rund um die uhr"]):
+        return True
+    if struct:
+        all_full = True
+        for d in DAYS:
+            slots = struct.get(d) or []
+            if not slots:
+                all_full = False
+                break
+            if not any(s <= 0 and e >= 24 for s, e in slots):
+                all_full = False
+                break
+        if all_full:
+            return True
+    return False
+
+def infer_emergency_from_hours(struct: Dict[str, List[List[float]]]) -> bool:
+    """
+    Heuristic: emergency if any interval goes late (after 22:00) or very early (before 07:00).
+    """
+    for d, slots in (struct or {}).items():
+        for s, e in slots:
+            if e > 22.0 or s < 7.0:
+                return True
+    return False
+
+def derive_emergency(opening_hours: str, name: str, extra: str = "", types: Optional[List[str]] = None) -> bool:
+    blob = " ".join([
+        opening_hours or "",
+        name or "",
+        extra or "",
+    ]).lower()
+
+    if any(kw in blob for kw in EMERGENCY_KWS):
+        return True
+
+    # Google types hint
+    if types:
+        t_low = {t.lower() for t in types}
+        if any(t in t_low for t in ["animal_hospital", "emergency_service", "hospital"]):
+            return True
+
+    # If name contains Tierklinik / Klinik, treat as emergency (favour recall)
+    nl = (name or "").lower()
+    if "tierklinik" in nl or "klinik" in nl:
+        return True
+
+    return False
 
 def extract_hours_text_from_html(html: str) -> str:
+    """
+    Pulls a compact hours string from the page:
+    - prefer schema.org openingHours / openingHoursSpecification
+    - else headings/labels like Öffnungszeiten, Sprechzeiten, Opening Hours
+    """
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         return ""
-    # JSON-LD first
+
+    # 1) JSON-LD (schema.org)
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             j = json.loads(tag.string or "{}")
-            if isinstance(j, dict):
-                oh = j.get("openingHours") or j.get("openingHoursSpecification")
-                if isinstance(oh, str):
-                    return oh
+            items = j if isinstance(j, list) else [j]
+            for o in items:
+                if not isinstance(o, dict):
+                    continue
+                oh = o.get("openingHours") or o.get("openingHoursSpecification")
                 if isinstance(oh, list):
-                    return "; ".join(map(str, oh))
-            if isinstance(j, list):
-                for o in j:
-                    oh = o.get("openingHours") or o.get("openingHoursSpecification")
-                    if isinstance(oh, str):
+                    txt = "; ".join([str(x) for x in oh])
+                    if txt.strip():
+                        return txt
+                elif isinstance(oh, str):
+                    if oh.strip():
                         return oh
-                    if isinstance(oh, list):
-                        return "; ".join(map(str, oh))
         except Exception:
             pass
-    # Label-based heuristics
+
+    # 2) Label-based heuristics
     labels = ["öffnungszeiten", "sprechzeiten", "sprechstunde", "opening hours", "hours"]
-    blocks = []
+    blocks: List[str] = []
     for el in soup.find_all(text=True):
         s = (el or "").strip()
         if not s:
@@ -271,6 +452,7 @@ def extract_hours_text_from_html(html: str) -> str:
                     if len(" ".join(trail)) > 300:
                         break
                 blocks.append(" ".join([s] + trail))
+
     return max(blocks, key=len) if blocks else ""
 
 def fetch_site(url: str) -> str:
@@ -293,187 +475,6 @@ def fetch_site(url: str) -> str:
         return ""
     return ""
 
-# --- NEW: day + time parsing for structured JSON ---
-
-DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-DAY_ALIASES = {
-    "monday": "mon", "mon": "mon", "montag": "mon", "mo": "mon",
-    "tuesday": "tue", "tue": "tue", "dienstag": "tue", "di": "tue",
-    "wednesday": "wed", "wed": "wed", "mittwoch": "wed", "mi": "wed",
-    "thursday": "thu", "thu": "thu", "donnerstag": "thu", "do": "thu",
-    "friday": "fri", "fri": "fri", "freitag": "fri", "fr": "fri",
-    "saturday": "sat", "sat": "sat", "samstag": "sat", "sa": "sat",
-    "sunday": "sun", "sun": "sun", "sonntag": "sun", "so": "sun",
-}
-
-def canonical_day(label: str) -> Optional[str]:
-    if not label:
-        return None
-    key = label.strip().lower()
-    return DAY_ALIASES.get(key)
-
-def parse_time_token(token: str) -> Optional[float]:
-    """
-    Parse a time token like '9:00', '09:30', '9 AM', '6:30PM', '18'.
-    Returns decimal hours (e.g. 9.0, 18.5).
-    """
-    if not token:
-        return None
-    t = token.strip().lower()
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", t)
-    if not m:
-        return None
-    hour = int(m.group(1))
-    minute = int(m.group(2) or 0)
-    ampm = m.group(3)
-
-    if ampm == "pm" and hour < 12:
-        hour += 12
-    if ampm == "am" and hour == 12:
-        hour = 0
-
-    if hour > 24:
-        return None
-    return hour + minute / 60.0
-
-def parse_time_range(range_str: str) -> Optional[Tuple[float, float]]:
-    """
-    Parse a range like '9:00-18:00', '9:00 – 18:00', '9 AM – 6 PM'.
-    """
-    if not range_str:
-        return None
-    # Split on common separators
-    parts = re.split(r"\s*[–\-–]\s*|\s+to\s+", range_str, maxsplit=1)
-    if len(parts) != 2:
-        return None
-    start = parse_time_token(parts[0])
-    end = parse_time_token(parts[1])
-    if start is None or end is None:
-        return None
-    return (start, end)
-
-def parse_opening_hours_struct(raw: str) -> Dict[str, List[List[float]]]:
-    """
-    Best-effort parser to build:
-      { "mon": [[9, 18]], "tue": [[9, 12], [14, 18]], ... }
-    Works best on:
-    - Google weekday_text lines joined with '; '
-    - Simple OSM-like lines: 'Mo-Fr 09:00-18:00; Sa 10:00-14:00'
-    """
-    struct = {d: [] for d in DAY_KEYS}
-    if not raw:
-        return struct
-
-    text = raw.strip()
-    # Split lines by ';'
-    lines = re.split(r";\s*", text)
-
-    for line in lines:
-        if not line:
-            continue
-        l = line.strip()
-        # If explicitly closed
-        if any(kw in l.lower() for kw in ["geschlossen", "closed"]):
-            # we keep [] for that day
-            pass
-
-        # Try Google style: "Monday: 9:00 AM – 6:00 PM"
-        if ":" in l:
-            before, after = l.split(":", 1)
-            day_label = before.strip()
-            day_key = canonical_day(day_label)
-            if not day_key:
-                # Could be "Mon-Fri: 9-18" etc → fall through to generic
-                pass
-            else:
-                # After part: "9:00 AM – 6:00 PM" or "Closed"
-                if any(kw in after.lower() for kw in ["closed", "geschlossen"]):
-                    continue
-                # Split multiple intervals by commas
-                ranges = re.split(r",\s*", after)
-                for r in ranges:
-                    tr = parse_time_range(r)
-                    if tr:
-                        start, end = tr
-                        struct[day_key].append([start, end])
-                continue  # handled
-
-        # Try OSM-like: "Mo-Fr 09:00-18:00", "Sa 10:00-14:00"
-        m = re.match(r"^\s*([A-Za-zÄÖÜäöü,.\-\s]+)\s+([0-9:.\sAPMapm–\-to]+)\s*$", l)
-        if not m:
-            continue
-        days_part = m.group(1)
-        times_part = m.group(2)
-
-        # Parse days: handle ranges "Mo-Fr" and lists "Mo,Tu,We"
-        day_tokens = re.split(r",\s*", days_part.strip())
-        day_list: List[str] = []
-        for dt in day_tokens:
-            dt = dt.strip()
-            if "-" in dt:
-                left, right = [x.strip() for x in re.split(r"\s*-\s*", dt)]
-                left_key = canonical_day(left)
-                right_key = canonical_day(right)
-                if left_key and right_key:
-                    start_idx = DAY_KEYS.index(left_key)
-                    end_idx = DAY_KEYS.index(right_key)
-                    if start_idx <= end_idx:
-                        day_list.extend(DAY_KEYS[start_idx:end_idx+1])
-            else:
-                dk = canonical_day(dt)
-                if dk:
-                    day_list.append(dk)
-
-        if not day_list:
-            continue
-
-        # Parse times
-        time_ranges = re.split(r",\s*", times_part.strip())
-        parsed_ranges: List[Tuple[float, float]] = []
-        for tr in time_ranges:
-            pr = parse_time_range(tr)
-            if pr:
-                parsed_ranges.append(pr)
-
-        for d in day_list:
-            for (start, end) in parsed_ranges:
-                struct[d].append([start, end])
-
-    return struct
-
-def build_opening_hours_json(raw: str, source: str, emergency_flag: bool) -> Dict[str, Any]:
-    """
-    Build the final JSON object for the jsonb column:
-      {
-        "raw": "...",
-        "structured": { "mon": [[9,18]], ... },
-        "is_247": true/false,
-        "emergency": true/false,
-        "source": "osm"/"google"
-      }
-    """
-    raw = raw or ""
-    is_247 = looks_247(raw)
-    structured = {d: [] for d in DAY_KEYS}
-
-    if is_247:
-        # Represent 24/7 as 0–24 each day
-        for d in DAY_KEYS:
-            structured[d] = [[0.0, 24.0]]
-    elif raw:
-        structured = parse_opening_hours_struct(raw)
-
-    is_emergency = bool(emergency_flag) or is_247
-
-    return {
-        "raw": raw,
-        "structured": structured,
-        "is_247": is_247,
-        "emergency": is_emergency,
-        "source": source,
-    }
-
 # ----------------------------
 # Pet types & specialist detection
 # ----------------------------
@@ -485,7 +486,7 @@ PET_TYPE_MAP = {
     "small_mammal": [
         "kleintier", "kleintiere", "nagetier", "nagetiere",
         "meerschweinchen", "hamster", "chinchilla", "ratte", "ratten",
-        "maus", "mäuse", "gerbil"
+        "maus", "mäuse", "gerbil",
     ],
     "bird": ["vogel", "vögel", "papagei", "papageien", "sittich", "sittiche", "kanarienvogel", "kanarien"],
     "reptile": ["reptil", "reptilien", "schildkröte", "schildkröten", "schlange", "schlangen", "echse", "echsen", "leguan"],
@@ -603,7 +604,7 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
     if any(kw in text_l for kw in ["labor", "labordiagnostik", "blutuntersuchung", "diagnostik", "laboratory"]):
         services.add("lab")
 
-    # Physio, behaviour, nutrition, exotics (from specialist detection)
+    # Physio, behaviour, nutrition, exotics (from text)
     if any(kw in text_l for kw in ["physiotherapie", "rehab", "rehabilitation", "physio"]):
         services.add("physio_therapy")
     if any(kw in text_l for kw in ["verhaltenstherapie", "verhalten", "behavior"]):
@@ -716,8 +717,7 @@ def fetch_osm_veterinary(
         if looks_247(raw_oh):
             opening_hours = "24/7"
         elif raw_oh:
-            segs = parse_hours_with_opentimeparser(raw_oh)
-            opening_hours = normalize_osm_oh(segs) if segs else raw_oh
+            opening_hours = raw_oh
 
         html = ""
         if enrich_websites and website:
@@ -727,12 +727,18 @@ def fetch_osm_veterinary(
             candidate = extract_hours_text_from_html(html)
             if looks_247(candidate):
                 opening_hours = "24/7"
-            else:
-                segs = parse_hours_with_opentimeparser(candidate)
-                opening_hours = normalize_osm_oh(segs) if segs else (candidate[:200] if candidate else "")
+            elif candidate:
+                opening_hours = candidate[:400]
+
+        # Emergency based on text + name
+        is_emergency = derive_emergency(
+            opening_hours,
+            name,
+            (tags.get("description") or "") + " " + (tags.get("services") or ""),
+            types=None,
+        )
 
         is_247 = looks_247(opening_hours)
-        is_emergency = derive_emergency(opening_hours, name, tags.get("description", ""))
 
         blob = " ".join([
             name,
@@ -810,10 +816,6 @@ def google_nearby_for_tile(center_lat: float, center_lng: float, api_key: str) -
     return results
 
 def google_text_search_for_city(query: str, api_key: str) -> List[Dict[str, Any]]:
-    """
-    Use Places Text Search to find clinics by keyword, e.g. 'Tierarzt Berlin'.
-    We still later filter to veterinary_care-type results.
-    """
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {
         "query": query,
@@ -949,13 +951,20 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     oh = result.get("opening_hours") or {}
     weekday_text = oh.get("weekday_text")
     if isinstance(weekday_text, list) and weekday_text:
-        # Join with '; ' so parse_opening_hours_struct can split lines
+        # "Monday: 09:00–18:00; Tuesday: 09:00–18:00; ..."
         opening_hours = "; ".join(weekday_text)
 
-    is_247 = looks_247(opening_hours)
-    is_emergency = derive_emergency(opening_hours, name, "")
-
     types_all = basic.get("types", []) or result.get("types", []) or []
+
+    is_247 = looks_247(opening_hours)
+    # Emergency based on types + text + name
+    is_emergency = derive_emergency(
+        opening_hours,
+        name,
+        "",
+        types=types_all,
+    )
+
     blob = " ".join([name] + types_all + [opening_hours or ""])
 
     pet_types = detect_pet_types(blob)
@@ -1062,7 +1071,11 @@ def fill_missing_address(clinics: List[Clinic]) -> List[Clinic]:
 
 def norm_name_for_match(name: str) -> str:
     n = (name or "").lower()
-    n = re.sub(r"\b(dr\.?|doktor|tierarztpraxis|tierarzt|tierärztin|tierklinik|praxis|kleintierpraxis)\b", "", n)
+    n = re.sub(
+        r"\b(dr\.?|doktor|tierarztpraxis|tierarzt|tierärztin|tierklinik|praxis|kleintierpraxis)\b",
+        "",
+        n,
+    )
     n = re.sub(r"[^a-z0-9]+", "", n)
     return n.strip()
 
@@ -1115,7 +1128,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
             if not o.district and g.district:
                 o.district = g.district
 
-            # Opening hours: prefer longer
+            # Opening hours: prefer longer text
             if len(g.opening_hours or "") > len(o.opening_hours or ""):
                 o.opening_hours = g.opening_hours
 
@@ -1142,7 +1155,23 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
 def clinic_to_row(c: Clinic) -> Dict[str, Any]:
     opening = c.opening_hours or ""
-    opening_obj = build_opening_hours_json(opening, c.source, c.emergency_flag)
+
+    # Structured opening-hours (max parser)
+    struct = parse_opening_hours_to_struct(opening)
+    is_247 = infer_is_247(opening, struct)
+
+    # Emergency: combine all heuristics
+    hours_emergency = infer_emergency_from_hours(struct)
+    text_emergency = derive_emergency(opening, c.name, "", None)
+    is_emergency = bool(c.emergency_flag) or hours_emergency or text_emergency
+
+    opening_obj = {
+        "raw": opening,
+        "structured": struct,
+        "is_247": is_247,
+        "emergency": is_emergency,
+        "source": c.source,
+    }
 
     return {
         "name": c.name or "",
@@ -1155,16 +1184,15 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
         "phone": c.phone or "",
         "email": c.email or "",
         "website": c.website or "",
-        # JSON as string for CSV; Supabase jsonb will parse it
         "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
-        "emergency": bool(opening_obj["emergency"]),
+        "emergency": bool(is_emergency),
         "active": True,
         "description": "",
-        "emergency_boolean": bool(opening_obj["emergency"]),
+        "emergency_boolean": bool(is_emergency),
         "active_boolean": True,
         "booking_enabled": False,
         "supports_mobile": bool(c.supports_mobile),
-        "twentyfour_seven": bool(opening_obj["is_247"]),
+        "twentyfour_seven": bool(is_247),
         "offers_vaccination": True,
         "offers_checkup": True,
         "offers_illness": True,
@@ -1215,7 +1243,11 @@ def export_clinic_services(clinics: List[Clinic], out_dir: str, city_slug: str):
         w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_COLUMNS)
         w.writeheader()
         for c in clinics:
-            for code in sorted(c.service_codes):
+            # Make sure emergency service exists if clinic is flagged emergency
+            codes = set(c.service_codes)
+            if c.emergency_flag:
+                codes.add("emergency")
+            for code in sorted(codes):
                 label = SERVICE_LABELS.get(code, code.replace("_", " ").title())
                 w.writerow({
                     "clinic_name": c.name,

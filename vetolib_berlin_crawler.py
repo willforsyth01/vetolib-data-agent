@@ -8,18 +8,21 @@ Scope:
 - Berlin region (using BERLIN_BBOX, includes Teltow / Brandenburg inside bbox)
 - Vets only (OSM + Google Places "veterinary_care")
 - Large pool kept, only clearly non-vet businesses removed
-- Outputs 4 DB-ready CSVs in ./out:
+- Outputs 5 files in ./out:
 
-  1) clinics_<city>_db.csv
+  1) clinics_<city>.csv
      → matches public.clinics (explicit id, ready for import)
 
-  2) clinic_pet_types_<city>_db.csv
+  2) clinics_<city>.jsonl
+     → same columns as CSV, line-delimited JSON (for agents/dev tools)
+
+  3) clinic_pet_types_<city>.csv
      → clinic_id, pet (public.pet_type)
 
-  3) clinic_services_<city>_db.csv
+  4) clinic_services_<city>.csv
      → id, clinic_id, service_code, label, ..., name, description
 
-  4) clinic_specialists_<city>_db.csv
+  5) clinic_specialists_<city>.csv
      → clinic_id, area (public.specialist_area)
 
 Env:
@@ -59,12 +62,12 @@ OVERPASS_URLS = [
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-HEADERS = {"User-Agent": "Vetolib-Agent/1.8 (+https://vetolib.app)"}
+HEADERS = {"User-Agent": "Vetolib-Agent/1.9 (+https://vetolib.app)"}
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
 # DB-aligned clinics columns (explicit id, subset of table)
-CLINIC_DB_COLUMNS = [
+CLINIC_COLUMNS = [
     "id",
     "name",
     "street",
@@ -1168,17 +1171,14 @@ def filter_to_vets_region(clinics: List[Clinic], bbox: Tuple[float,float,float,f
     filtered: List[Clinic] = []
 
     for c in clinics:
-        # Must have coordinates inside bbox
         if not (c.lat and c.lng and within_bbox(c.lat, c.lng, bbox)):
             continue
 
-        # Drop only if it's clearly a non-vet business
         if is_definitely_non_vet(c.name):
             continue
 
         filtered.append(c)
 
-    # Deduplicate by (normalized name, lat, lng)
     seen = set()
     uniq: List[Clinic] = []
     for c in filtered:
@@ -1192,7 +1192,7 @@ def filter_to_vets_region(clinics: List[Clinic], bbox: Tuple[float,float,float,f
     return uniq
 
 # ----------------------------
-# Export helpers (DB-ready)
+# Export helpers (DB-ready + JSONL)
 # ----------------------------
 
 def clinic_to_opening_obj(c: Clinic) -> Dict[str, Any]:
@@ -1210,7 +1210,7 @@ def clinic_to_opening_obj(c: Clinic) -> Dict[str, Any]:
         "source": c.source,
     }
 
-def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
+def export_all(clinics: List[Clinic], out_dir: str, city_slug: str):
     os.makedirs(out_dir, exist_ok=True)
 
     # Map Clinic objects → UUIDs
@@ -1218,10 +1218,14 @@ def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
     for idx, c in enumerate(clinics):
         clinic_ids[idx] = str(uuid.uuid4())
 
-    # 1) Clinics
-    clinics_path = os.path.join(out_dir, f"clinics_{city_slug}_db.csv")
-    with open(clinics_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_DB_COLUMNS)
+    # 1) Clinics CSV + JSONL
+    clinics_csv_path = os.path.join(out_dir, f"clinics_{city_slug}.csv")
+    clinics_jsonl_path = os.path.join(out_dir, f"clinics_{city_slug}.jsonl")
+
+    with open(clinics_csv_path, "w", newline="", encoding="utf-8") as f_csv, \
+         open(clinics_jsonl_path, "w", encoding="utf-8") as f_jsonl:
+
+        w = csv.DictWriter(f_csv, fieldnames=CLINIC_COLUMNS)
         w.writeheader()
 
         for idx, c in enumerate(clinics):
@@ -1272,12 +1276,16 @@ def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
                 "last_login_at": "",
             }
 
+            # CSV row
             w.writerow(row)
+            # JSONL line (same fields)
+            f_jsonl.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print(f"✅ Exported DB clinics CSV → {clinics_path}")
+    print(f"✅ Exported clinics CSV → {clinics_csv_path}")
+    print(f"✅ Exported clinics JSONL → {clinics_jsonl_path}")
 
     # 2) Pet types
-    pet_path = os.path.join(out_dir, f"clinic_pet_types_{city_slug}_db.csv")
+    pet_path = os.path.join(out_dir, f"clinic_pet_types_{city_slug}.csv")
     with open(pet_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=PET_TYPES_COLUMNS_DB)
         w.writeheader()
@@ -1288,10 +1296,10 @@ def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
                     "clinic_id": cid,
                     "pet": pet,
                 })
-    print(f"✅ Exported DB clinic_pet_types CSV → {pet_path}")
+    print(f"✅ Exported clinic_pet_types CSV → {pet_path}")
 
     # 3) Services
-    svc_path = os.path.join(out_dir, f"clinic_services_{city_slug}_db.csv")
+    svc_path = os.path.join(out_dir, f"clinic_services_{city_slug}.csv")
     with open(svc_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_COLUMNS_DB)
         w.writeheader()
@@ -1318,10 +1326,10 @@ def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
                     "description": "",
                     "icon": "",
                 })
-    print(f"✅ Exported DB clinic_services CSV → {svc_path}")
+    print(f"✅ Exported clinic_services CSV → {svc_path}")
 
     # 4) Specialists
-    spec_path = os.path.join(out_dir, f"clinic_specialists_{city_slug}_db.csv")
+    spec_path = os.path.join(out_dir, f"clinic_specialists_{city_slug}.csv")
     with open(spec_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CLINIC_SPECIALISTS_COLUMNS_DB)
         w.writeheader()
@@ -1332,7 +1340,7 @@ def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
                     "clinic_id": cid,
                     "area": area,
                 })
-    print(f"✅ Exported DB clinic_specialists CSV → {spec_path}")
+    print(f"✅ Exported clinic_specialists CSV → {spec_path}")
 
 # ----------------------------
 # Main
@@ -1382,12 +1390,11 @@ def main():
     if not args.no_geocode:
         merged = fill_missing_address(merged)
 
-    # Final vet+region filtering (no hard postcode/city requirement, just bbox + non-vet exclusion)
     cleaned = filter_to_vets_region(merged, bbox)
 
     print(f"🧹 Final clinic count after merge + vet/region filters: {len(cleaned)}")
 
-    export_db_csvs(cleaned, args.output_dir, city_slug)
+    export_all(cleaned, args.output_dir, city_slug)
 
 if __name__ == "__main__":
     main()

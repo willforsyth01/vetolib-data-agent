@@ -2,27 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-Vetolib Berlin Crawler — Clinics + Pet Types + Services + Specialists
+Vetolib Berlin Crawler — DB-ready exports
 
 Scope:
 - Berlin only (using BERLIN_BBOX)
-- Vets only (OSM + Google Places "veterinary_care")
-- Outputs 4 CSVs in ./out:
+- Vets only (OSM + optional Google Places "veterinary_care")
+- Outputs 4 DB-aligned CSVs in ./out:
 
   1) clinics_<city>.csv
-     → for public.clinics (subset of columns, no ids)
+     → matches public.clinics
 
   2) clinic_pet_types_<city>.csv
-     → natural keyed: clinic_name, postcode, city, pet (public.pet_type)
+     → matches public.clinic_pet_types
 
   3) clinic_services_<city>.csv
-     → clinic_name, postcode, city, service_code, label, name, description, ...
+     → matches public.clinic_services
 
   4) clinic_specialists_<city>.csv
-     → clinic_name, postcode, city, area (public.specialist_area)
+     → matches public.clinic_specialists
 
 Google:
-- Requires env GOOGLE_API_KEY
+- Requires env GOOGLE_API_KEY and flag --use-google-places
 
 Nominatim:
 - Uses env NOMINATIM_EMAIL for polite reverse geocoding
@@ -34,8 +34,10 @@ import csv
 import json
 import time
 import math
+import uuid
 import argparse
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import requests
@@ -63,12 +65,33 @@ HEADERS = {"User-Agent": "Vetolib-Agent/1.6 (+https://vetolib.app)"}
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
+# Hard Berlin postcode range (roughly)
+BERLIN_POSTCODE_MIN = 10115
+BERLIN_POSTCODE_MAX = 14199
+
+# Name-based vet filters
+VET_NAME_KEYWORDS = [
+    "tierarzt", "tierärzt", "tierarztpraxis",
+    "tierklinik", "kleintierpraxis", "kleintierklinik",
+    "veterinär", "veterinary", "vet",
+]
+
+EXCLUDE_NAME_KEYWORDS = [
+    "hundeschule", "dogschool", "trainer", "training",
+    "heilpraktiker", "tierheilpraktiker",
+    "physio", "physiotherapie", "physiotherapy",
+    "grooming", "friseur", "fellpflege",
+    "futterhaus", "zoofachhandel", "pet shop", "tierbedarf",
+    "pension", "hotel", "boarding", "sitter", "dogwalking",
+]
+
 # ----------------------------
-# Supabase clinics CSV columns
-# (subset of public.clinics; omit id/auth/created_at/etc)
+# DB-aligned column sets
 # ----------------------------
 
-CLINIC_COLUMNS = [
+# EXACT order for public.clinics
+CLINIC_DB_COLUMNS = [
+    "id",
     "name",
     "street",
     "district",
@@ -82,58 +105,79 @@ CLINIC_COLUMNS = [
     "opening_hours",
     "emergency",
     "active",
+    "created_at",
+    "updated_at",
     "description",
     "emergency_boolean",
     "active_boolean",
     "booking_enabled",
     "supports_mobile",
     "twentyfour_seven",
+    "got_min_multiplier",
+    "got_max_multiplier",
+    "weekend_min_multiplier",
+    "notdienst_fee_eur",
+    "got_notes",
+    "weekend_policy_notes",
+    "travel_cost_per_double_km_eur",
+    "travel_cost_min_eur",
+    "mobile_service_area_km",
     "offers_vaccination",
     "offers_checkup",
     "offers_illness",
     "offers_prescription",
     "offers_dental",
+    "auth_user_id",
     "contact_email",
     "onboarding_status",
+    "invite_sent_at",
+    "last_login_at",
 ]
 
-# Staging-style outputs for enrichment tables
-PET_TYPES_COLUMNS = [
-    "clinic_name",
-    "postcode",
-    "city",
-    "pet",  # public.pet_type
+# public.clinic_pet_types
+CLINIC_PET_TYPES_DB_COLUMNS = [
+    "clinic_id",
+    "pet",
 ]
 
-CLINIC_SERVICES_COLUMNS = [
-    "clinic_name",
-    "postcode",
-    "city",
+# public.clinic_services
+CLINIC_SERVICES_DB_COLUMNS = [
+    "id",
+    "clinic_id",
     "service_code",
     "label",
     "got_ref",
     "price_min_eur",
     "price_max_eur",
     "notes",
+    "created_at",
+    "updated_at",
     "name",
     "description",
     "icon",
 ]
 
-CLINIC_SPECIALISTS_COLUMNS = [
-    "clinic_name",
-    "postcode",
-    "city",
-    "area",  # public.specialist_area
+# public.clinic_specialists
+CLINIC_SPECIALISTS_DB_COLUMNS = [
+    "clinic_id",
+    "area",
 ]
 
 # ----------------------------
 # Helpers (general)
 # ----------------------------
 
+def gen_uuid() -> str:
+    return str(uuid.uuid4())
+
+def now_ts() -> str:
+    # ISO8601 UTC with Z
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 def within_bbox(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> bool:
+    """Check if lat/lon lies inside bbox (minlon, minlat, maxlon, maxlat)."""
     minlon, minlat, maxlon, maxlat = bbox
-    return (minlat <= lat <= maxlat) and (minlon <= lon <= maxlat)
+    return (minlat <= lat <= maxlat) and (minlon <= lon <= maxlon)
 
 def norm_url(url: str) -> str:
     if not url:
@@ -195,6 +239,25 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
+
+def is_berlin_postcode(pc: str) -> bool:
+    try:
+        n = int(str(pc).strip())
+    except (ValueError, TypeError):
+        return False
+    return BERLIN_POSTCODE_MIN <= n <= BERLIN_POSTCODE_MAX
+
+def is_likely_vet(name: str) -> bool:
+    if not isinstance(name, str) or not name.strip():
+        return False
+    s = name.lower()
+    if any(bad in s for bad in EXCLUDE_NAME_KEYWORDS):
+        return False
+    if any(kw in s for kw in VET_NAME_KEYWORDS):
+        return True
+    if "tierarzt" in s or "tierärzte" in s:
+        return True
+    return False
 
 # ----------------------------
 # Opening-hours + emergency helpers (MAX parser)
@@ -284,7 +347,6 @@ def parse_days_expr(expr: str) -> List[str]:
 def parse_time_ranges(expr: str) -> List[List[float]]:
     expr = expr.replace("–", "-").replace("—", "-")
     ranges: List[List[float]] = []
-    # e.g. 09:00-13:00,14:00-18:00
     for m in re.finditer(
         r"(\d{1,2})(?::|\.|h)?(\d{2})?\s*-\s*(\d{1,2})(?::|\.|h)?(\d{2})?",
         expr,
@@ -366,7 +428,7 @@ def infer_emergency_from_hours(struct: Dict[str, List[List[float]]]) -> bool:
     """
     Heuristic: emergency if any interval goes late (after 22:00) or very early (before 07:00).
     """
-    for d, slots in (struct or {}).items():
+    for _d, slots in (struct or {}).items():
         for s, e in slots:
             if e > 22.0 or s < 7.0:
                 return True
@@ -628,6 +690,7 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
 
 @dataclass
 class Clinic:
+    id: Optional[str]  # will be filled before export
     name: str
     street: str
     district: str
@@ -755,6 +818,7 @@ def fetch_osm_veterinary(
         supports_mobile = any(kw in blob.lower() for kw in ["hausbesuch", "mobile tierarzt", "fahrpraxis"])
 
         c = Clinic(
+            id=None,
             name=name,
             street=street,
             district=district,
@@ -974,7 +1038,8 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     supports_mobile = any(kw in blob.lower() for kw in ["hausbesuch", "mobile tierarzt", "fahrpraxis"])
 
     c = Clinic(
-        name=name,  # Option D: trust Google name
+        id=None,
+        name=name,  # trust Google name
         street=street,
         district=district,
         city=city or city_fallback,
@@ -1111,7 +1176,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
         if best_idx is not None:
             o = merged[best_idx]
-            # Name: trust Google (Option D)
+            # Name: trust Google
             o.name = g.name or o.name
 
             # Prefer Google contact if missing
@@ -1153,7 +1218,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 # Export helpers
 # ----------------------------
 
-def clinic_to_row(c: Clinic) -> Dict[str, Any]:
+def clinic_to_row(c: Clinic, created_ts: str) -> Dict[str, Any]:
     opening = c.opening_hours or ""
 
     # Structured opening-hours (max parser)
@@ -1174,6 +1239,7 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
     }
 
     return {
+        "id": c.id,
         "name": c.name or "",
         "street": c.street or "",
         "district": c.district or "",
@@ -1187,19 +1253,33 @@ def clinic_to_row(c: Clinic) -> Dict[str, Any]:
         "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
         "emergency": bool(is_emergency),
         "active": True,
+        "created_at": created_ts,
+        "updated_at": created_ts,
         "description": "",
         "emergency_boolean": bool(is_emergency),
         "active_boolean": True,
         "booking_enabled": False,
         "supports_mobile": bool(c.supports_mobile),
         "twentyfour_seven": bool(is_247),
+        "got_min_multiplier": "",
+        "got_max_multiplier": "",
+        "weekend_min_multiplier": "",
+        "notdienst_fee_eur": "",
+        "got_notes": "",
+        "weekend_policy_notes": "",
+        "travel_cost_per_double_km_eur": "",
+        "travel_cost_min_eur": "",
+        "mobile_service_area_km": "",
         "offers_vaccination": True,
         "offers_checkup": True,
         "offers_illness": True,
         "offers_prescription": True,
         "offers_dental": bool(c.offers_dental),
+        "auth_user_id": "",
         "contact_email": c.email or "",
         "onboarding_status": "not_invited",
+        "invite_sent_at": "",
+        "last_login_at": "",
     }
 
 def export_clinics_csv(clinics: List[Clinic], out_dir: str, city_slug: str):
@@ -1207,17 +1287,20 @@ def export_clinics_csv(clinics: List[Clinic], out_dir: str, city_slug: str):
     csv_path = os.path.join(out_dir, f"clinics_{city_slug}.csv")
     jsonl_path = os.path.join(out_dir, f"clinics_{city_slug}.jsonl")
 
-    rows = [clinic_to_row(c) for c in clinics]
+    created_ts = now_ts()
+    rows = [clinic_to_row(c, created_ts) for c in clinics]
 
+    # CSV
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=CLINIC_DB_COLUMNS)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in CLINIC_COLUMNS})
+            w.writerow({k: r.get(k, "") for k in CLINIC_DB_COLUMNS})
 
+    # JSONL (optional, nice for debugging / agents)
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for r in rows:
-            f.write(json.dumps({k: r.get(k, "") for k in CLINIC_COLUMNS}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({k: r.get(k, "") for k in CLINIC_DB_COLUMNS}, ensure_ascii=False) + "\n")
 
     print(f"✅ Exported clinics CSV → {csv_path}")
     print(f"✅ Exported clinics JSONL → {jsonl_path}")
@@ -1225,40 +1308,43 @@ def export_clinics_csv(clinics: List[Clinic], out_dir: str, city_slug: str):
 def export_clinic_pet_types(clinics: List[Clinic], out_dir: str, city_slug: str):
     path = os.path.join(out_dir, f"clinic_pet_types_{city_slug}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=PET_TYPES_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=CLINIC_PET_TYPES_DB_COLUMNS)
         w.writeheader()
         for c in clinics:
+            if not c.id:
+                continue
             for pet in sorted(c.pet_types):
                 w.writerow({
-                    "clinic_name": c.name,
-                    "postcode": c.postcode,
-                    "city": c.city,
+                    "clinic_id": c.id,
                     "pet": pet,
                 })
     print(f"✅ Exported clinic_pet_types CSV → {path}")
 
 def export_clinic_services(clinics: List[Clinic], out_dir: str, city_slug: str):
     path = os.path.join(out_dir, f"clinic_services_{city_slug}.csv")
+    created_ts = now_ts()
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_DB_COLUMNS)
         w.writeheader()
         for c in clinics:
-            # Make sure emergency service exists if clinic is flagged emergency
-            codes = set(c.service_codes)
+            if not c.id:
+                continue
+            codes = set(c.service_codes or set())
             if c.emergency_flag:
                 codes.add("emergency")
             for code in sorted(codes):
                 label = SERVICE_LABELS.get(code, code.replace("_", " ").title())
                 w.writerow({
-                    "clinic_name": c.name,
-                    "postcode": c.postcode,
-                    "city": c.city,
+                    "id": gen_uuid(),
+                    "clinic_id": c.id,
                     "service_code": code,
                     "label": label,
                     "got_ref": "",
                     "price_min_eur": "",
                     "price_max_eur": "",
                     "notes": "",
+                    "created_at": created_ts,
+                    "updated_at": created_ts,
                     "name": label,
                     "description": "",
                     "icon": "",
@@ -1268,14 +1354,14 @@ def export_clinic_services(clinics: List[Clinic], out_dir: str, city_slug: str):
 def export_clinic_specialists(clinics: List[Clinic], out_dir: str, city_slug: str):
     path = os.path.join(out_dir, f"clinic_specialists_{city_slug}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_SPECIALISTS_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=CLINIC_SPECIALISTS_DB_COLUMNS)
         w.writeheader()
         for c in clinics:
+            if not c.id:
+                continue
             for area in sorted(c.specialists):
                 w.writerow({
-                    "clinic_name": c.name,
-                    "postcode": c.postcode,
-                    "city": c.city,
+                    "clinic_id": c.id,
                     "area": area,
                 })
     print(f"✅ Exported clinic_specialists CSV → {path}")
@@ -1328,14 +1414,41 @@ def main():
     if not args.no_geocode:
         merged = fill_missing_address(merged)
 
+    # Still respect BBOX
     merged = [c for c in merged if c.lat and c.lng and within_bbox(c.lat, c.lng, bbox)]
 
-    print(f"🧹 Final clinic count after merge/dedupe: {len(merged)}")
+    # Berlin-only + vet-only filter + postcode & dedupe
+    filtered: List[Clinic] = []
+    for c in merged:
+        city_clean = (c.city or "").strip().lower()
+        if city_clean != "berlin":
+            continue
+        if not c.postcode or not is_berlin_postcode(c.postcode):
+            continue
+        if not is_likely_vet(c.name):
+            continue
+        filtered.append(c)
 
-    export_clinics_csv(merged, args.output_dir, city_slug)
-    export_clinic_pet_types(merged, args.output_dir, city_slug)
-    export_clinic_services(merged, args.output_dir, city_slug)
-    export_clinic_specialists(merged, args.output_dir, city_slug)
+    uniq: List[Clinic] = []
+    seen_keys = set()
+    for c in filtered:
+        key = (norm_name_for_match(c.name), str(c.postcode))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        uniq.append(c)
+
+    print(f"🧹 Final clinic count after merge + geocode + Berlin/vet filters + dedupe: {len(uniq)}")
+
+    # Assign UUIDs to each clinic for DB IDs
+    for c in uniq:
+        c.id = gen_uuid()
+
+    # Export DB-aligned CSVs
+    export_clinics_csv(uniq, args.output_dir, city_slug)
+    export_clinic_pet_types(uniq, args.output_dir, city_slug)
+    export_clinic_services(uniq, args.output_dir, city_slug)
+    export_clinic_specialists(uniq, args.output_dir, city_slug)
 
 if __name__ == "__main__":
     main()

@@ -2,30 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-Vetolib Berlin Crawler — DB-ready exports
+Vetolib Region Crawler — Clinics + Pet Types + Services + Specialists (DB-ready)
 
 Scope:
-- Berlin only (using BERLIN_BBOX)
-- Vets only (OSM + optional Google Places "veterinary_care")
-- Outputs 4 DB-aligned CSVs in ./out:
+- Berlin region (using BERLIN_BBOX, includes Teltow / Brandenburg inside bbox)
+- Vets only (OSM + Google Places "veterinary_care")
+- Large pool kept, only clearly non-vet businesses removed
+- Outputs 4 DB-ready CSVs in ./out:
 
-  1) clinics_<city>.csv
-     → matches public.clinics
+  1) clinics_<city>_db.csv
+     → matches public.clinics (explicit id, ready for import)
 
-  2) clinic_pet_types_<city>.csv
-     → matches public.clinic_pet_types
+  2) clinic_pet_types_<city>_db.csv
+     → clinic_id, pet (public.pet_type)
 
-  3) clinic_services_<city>.csv
-     → matches public.clinic_services
+  3) clinic_services_<city>_db.csv
+     → id, clinic_id, service_code, label, ..., name, description
 
-  4) clinic_specialists_<city>.csv
-     → matches public.clinic_specialists
+  4) clinic_specialists_<city>_db.csv
+     → clinic_id, area (public.specialist_area)
 
-Google:
-- Requires env GOOGLE_API_KEY and flag --use-google-places
-
-Nominatim:
-- Uses env NOMINATIM_EMAIL for polite reverse geocoding
+Env:
+- GOOGLE_API_KEY (optional, for Google Places)
+- NOMINATIM_EMAIL (for polite Nominatim usage)
 """
 
 import os
@@ -37,7 +36,6 @@ import math
 import uuid
 import argparse
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple, Set
 
 import requests
@@ -61,35 +59,11 @@ OVERPASS_URLS = [
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org"
 
-HEADERS = {"User-Agent": "Vetolib-Agent/1.6 (+https://vetolib.app)"}
+HEADERS = {"User-Agent": "Vetolib-Agent/1.8 (+https://vetolib.app)"}
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL", "you@example.com")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
-# Hard Berlin postcode range (roughly)
-BERLIN_POSTCODE_MIN = 10115
-BERLIN_POSTCODE_MAX = 14199
-
-# Name-based vet filters
-VET_NAME_KEYWORDS = [
-    "tierarzt", "tierärzt", "tierarztpraxis",
-    "tierklinik", "kleintierpraxis", "kleintierklinik",
-    "veterinär", "veterinary", "vet",
-]
-
-EXCLUDE_NAME_KEYWORDS = [
-    "hundeschule", "dogschool", "trainer", "training",
-    "heilpraktiker", "tierheilpraktiker",
-    "physio", "physiotherapie", "physiotherapy",
-    "grooming", "friseur", "fellpflege",
-    "futterhaus", "zoofachhandel", "pet shop", "tierbedarf",
-    "pension", "hotel", "boarding", "sitter", "dogwalking",
-]
-
-# ----------------------------
-# DB-aligned column sets
-# ----------------------------
-
-# EXACT order for public.clinics
+# DB-aligned clinics columns (explicit id, subset of table)
 CLINIC_DB_COLUMNS = [
     "id",
     "name",
@@ -105,8 +79,6 @@ CLINIC_DB_COLUMNS = [
     "opening_hours",
     "emergency",
     "active",
-    "created_at",
-    "updated_at",
     "description",
     "emergency_boolean",
     "active_boolean",
@@ -134,14 +106,12 @@ CLINIC_DB_COLUMNS = [
     "last_login_at",
 ]
 
-# public.clinic_pet_types
-CLINIC_PET_TYPES_DB_COLUMNS = [
+PET_TYPES_COLUMNS_DB = [
     "clinic_id",
     "pet",
 ]
 
-# public.clinic_services
-CLINIC_SERVICES_DB_COLUMNS = [
+CLINIC_SERVICES_COLUMNS_DB = [
     "id",
     "clinic_id",
     "service_code",
@@ -157,8 +127,7 @@ CLINIC_SERVICES_DB_COLUMNS = [
     "icon",
 ]
 
-# public.clinic_specialists
-CLINIC_SPECIALISTS_DB_COLUMNS = [
+CLINIC_SPECIALISTS_COLUMNS_DB = [
     "clinic_id",
     "area",
 ]
@@ -167,15 +136,7 @@ CLINIC_SPECIALISTS_DB_COLUMNS = [
 # Helpers (general)
 # ----------------------------
 
-def gen_uuid() -> str:
-    return str(uuid.uuid4())
-
-def now_ts() -> str:
-    # ISO8601 UTC with Z
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
 def within_bbox(lat: float, lon: float, bbox: Tuple[float, float, float, float]) -> bool:
-    """Check if lat/lon lies inside bbox (minlon, minlat, maxlon, maxlat)."""
     minlon, minlat, maxlon, maxlat = bbox
     return (minlat <= lat <= maxlat) and (minlon <= lon <= maxlon)
 
@@ -239,25 +200,6 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     return R * c
-
-def is_berlin_postcode(pc: str) -> bool:
-    try:
-        n = int(str(pc).strip())
-    except (ValueError, TypeError):
-        return False
-    return BERLIN_POSTCODE_MIN <= n <= BERLIN_POSTCODE_MAX
-
-def is_likely_vet(name: str) -> bool:
-    if not isinstance(name, str) or not name.strip():
-        return False
-    s = name.lower()
-    if any(bad in s for bad in EXCLUDE_NAME_KEYWORDS):
-        return False
-    if any(kw in s for kw in VET_NAME_KEYWORDS):
-        return True
-    if "tierarzt" in s or "tierärzte" in s:
-        return True
-    return False
 
 # ----------------------------
 # Opening-hours + emergency helpers (MAX parser)
@@ -335,7 +277,6 @@ def parse_days_expr(expr: str) -> List[str]:
         if not p:
             continue
         days.extend(parse_day_token(p))
-    # dedupe, preserve order
     seen = set()
     ordered = []
     for d in days:
@@ -363,12 +304,6 @@ def parse_time_ranges(expr: str) -> List[List[float]]:
     return ranges
 
 def parse_opening_hours_to_struct(raw: str) -> Dict[str, List[List[float]]]:
-    """
-    Maximum parser (heuristic) for:
-      - OSM style: "Mo-Fr 09:00-18:00; Sa 10:00-14:00"
-      - Mixed: "Mo-Sa 10:00-12:00, Mo 17:00-19:00, Tu,We,Fr 16:00-18:00, Th 17:00-19:00"
-      - Google style: "Monday: 09:00–18:00; Tuesday: 09:00–18:00"
-    """
     res: Dict[str, List[List[float]]] = {d: [] for d in DAYS}
     if not raw or not isinstance(raw, str):
         return res
@@ -376,18 +311,15 @@ def parse_opening_hours_to_struct(raw: str) -> Dict[str, List[List[float]]]:
     txt = raw.strip()
     low = txt.lower()
 
-    # 24/7 detection
     if any(k in low for k in ["24/7", "24 h", "24h", "rund um die uhr"]):
         for d in DAYS:
             res[d] = [[0.0, 24.0]]
         return res
 
-    # Normalise
     txt = txt.replace("\n", "; ")
     txt = txt.replace("–", "-").replace("—", "-")
     txt = re.sub(r"\s+", " ", txt)
 
-    # Pattern for: "Mo-Fr 09:00-18:00,14:00-18:00" and "Monday: 09:00-18:00"
     pattern = re.compile(
         r"(?P<days>(?:[A-Za-zÄÖÜäöü\.]{2,}(?:\s*[-,]\s*)?)+)\s*[: ]\s*"
         r"(?P<times>\d{1,2}[:\.h]?\d{0,2}\s*-\s*\d{1,2}[:\.h]?\d{0,2}"
@@ -425,10 +357,7 @@ def infer_is_247(opening_raw: str, struct: Dict[str, List[List[float]]]) -> bool
     return False
 
 def infer_emergency_from_hours(struct: Dict[str, List[List[float]]]) -> bool:
-    """
-    Heuristic: emergency if any interval goes late (after 22:00) or very early (before 07:00).
-    """
-    for _d, slots in (struct or {}).items():
+    for d, slots in (struct or {}).items():
         for s, e in slots:
             if e > 22.0 or s < 7.0:
                 return True
@@ -444,13 +373,11 @@ def derive_emergency(opening_hours: str, name: str, extra: str = "", types: Opti
     if any(kw in blob for kw in EMERGENCY_KWS):
         return True
 
-    # Google types hint
     if types:
         t_low = {t.lower() for t in types}
         if any(t in t_low for t in ["animal_hospital", "emergency_service", "hospital"]):
             return True
 
-    # If name contains Tierklinik / Klinik, treat as emergency (favour recall)
     nl = (name or "").lower()
     if "tierklinik" in nl or "klinik" in nl:
         return True
@@ -458,17 +385,11 @@ def derive_emergency(opening_hours: str, name: str, extra: str = "", types: Opti
     return False
 
 def extract_hours_text_from_html(html: str) -> str:
-    """
-    Pulls a compact hours string from the page:
-    - prefer schema.org openingHours / openingHoursSpecification
-    - else headings/labels like Öffnungszeiten, Sprechzeiten, Opening Hours
-    """
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         return ""
 
-    # 1) JSON-LD (schema.org)
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             j = json.loads(tag.string or "{}")
@@ -487,7 +408,6 @@ def extract_hours_text_from_html(html: str) -> str:
         except Exception:
             pass
 
-    # 2) Label-based heuristics
     labels = ["öffnungszeiten", "sprechzeiten", "sprechstunde", "opening hours", "hours"]
     blocks: List[str] = []
     for el in soup.find_all(text=True):
@@ -609,7 +529,6 @@ def detect_pet_types(text: str) -> Set[str]:
             if kw in text_l:
                 found.add(pet)
                 break
-    # Default dog+cat if nothing else detected
     if not found:
         found.update(["dog", "cat"])
     return found
@@ -628,18 +547,14 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
     text_l = (text or "").lower()
     services: Set[str] = set()
 
-    # Core services for almost every clinic
     services.update(["vaccination", "checkup", "illness", "prescription"])
 
-    # Dental
     if any(kw in text_l for kw in ["zahn", "dental", "zahnarzt", "zahnheilkunde"]):
         services.add("dental")
 
-    # Surgery
     if any(kw in text_l for kw in ["chirurgie", "operation", "operativ", "chirurg", "op "]):
         services.add("surgery")
 
-    # Imaging
     if any(kw in text_l for kw in ["röntgen", "roentgen", "x-ray", "ultraschall", "ultrasound", "ct", "mrt", "mri"]):
         services.add("imaging")
         if "ultraschall" in text_l or "ultrasound" in text_l:
@@ -647,26 +562,21 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
         if "röntgen" in text_l or "x-ray" in text_l:
             services.add("xray")
 
-    # Emergency
     if has_emergency or any(kw in text_l for kw in ["notdienst", "emergency", "24h", "24 stunden", "24/7"]):
         services.add("emergency")
 
-    # Home visits / mobile vet
     if any(kw in text_l for kw in ["hausbesuch", "hausbesuche", "home visit", "house call"]):
         services.add("home_visit")
         services.add("mobile_vet")
     if any(kw in text_l for kw in ["mobile tierarzt", "mobile praxis", "fahrpraxis"]):
         services.add("mobile_vet")
 
-    # Tele-vet
     if any(kw in text_l for kw in ["video", "online-sprechstunde", "telefonsprechstunde", "online-termin", "telemedizin"]):
         services.add("tele_vet")
 
-    # Lab / diagnostics
     if any(kw in text_l for kw in ["labor", "labordiagnostik", "blutuntersuchung", "diagnostik", "laboratory"]):
         services.add("lab")
 
-    # Physio, behaviour, nutrition, exotics (from text)
     if any(kw in text_l for kw in ["physiotherapie", "rehab", "rehabilitation", "physio"]):
         services.add("physio_therapy")
     if any(kw in text_l for kw in ["verhaltenstherapie", "verhalten", "behavior"]):
@@ -676,7 +586,6 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
     if any(kw in text_l for kw in ["exoten", "exotenmedizin", "exotic"]):
         services.add("exotics")
 
-    # Map specialist areas to services as well
     spec = detect_specialists(text)
     for s in spec:
         if s in SERVICE_LABELS:
@@ -690,7 +599,6 @@ def detect_services(text: str, has_emergency: bool) -> Set[str]:
 
 @dataclass
 class Clinic:
-    id: Optional[str]  # will be filled before export
     name: str
     street: str
     district: str
@@ -774,7 +682,6 @@ def fetch_osm_veterinary(
         phone = norm_phone(tags.get("phone", "") or tags.get("contact:phone", ""))
         email = tags.get("email", "") or tags.get("contact:email", "")
 
-        # Opening hours
         opening_hours = ""
         raw_oh = (tags.get("opening_hours") or "").strip()
         if looks_247(raw_oh):
@@ -793,7 +700,6 @@ def fetch_osm_veterinary(
             elif candidate:
                 opening_hours = candidate[:400]
 
-        # Emergency based on text + name
         is_emergency = derive_emergency(
             opening_hours,
             name,
@@ -818,7 +724,6 @@ def fetch_osm_veterinary(
         supports_mobile = any(kw in blob.lower() for kw in ["hausbesuch", "mobile tierarzt", "fahrpraxis"])
 
         c = Clinic(
-            id=None,
             name=name,
             street=street,
             district=district,
@@ -1015,13 +920,11 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     oh = result.get("opening_hours") or {}
     weekday_text = oh.get("weekday_text")
     if isinstance(weekday_text, list) and weekday_text:
-        # "Monday: 09:00–18:00; Tuesday: 09:00–18:00; ..."
         opening_hours = "; ".join(weekday_text)
 
     types_all = basic.get("types", []) or result.get("types", []) or []
 
     is_247 = looks_247(opening_hours)
-    # Emergency based on types + text + name
     is_emergency = derive_emergency(
         opening_hours,
         name,
@@ -1038,8 +941,7 @@ def google_place_details_to_clinic(place_id: str, basic: Dict[str, Any], api_key
     supports_mobile = any(kw in blob.lower() for kw in ["hausbesuch", "mobile tierarzt", "fahrpraxis"])
 
     c = Clinic(
-        id=None,
-        name=name,  # trust Google name
+        name=name,
         street=street,
         district=district,
         city=city or city_fallback,
@@ -1176,16 +1078,13 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
         if best_idx is not None:
             o = merged[best_idx]
-            # Name: trust Google
             o.name = g.name or o.name
 
-            # Prefer Google contact if missing
             if not o.phone and g.phone:
                 o.phone = g.phone
             if not o.website and g.website:
                 o.website = g.website
 
-            # Address fill
             if not o.street and g.street:
                 o.street = g.street
             if not o.postcode and g.postcode:
@@ -1193,11 +1092,9 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
             if not o.district and g.district:
                 o.district = g.district
 
-            # Opening hours: prefer longer text
             if len(g.opening_hours or "") > len(o.opening_hours or ""):
                 o.opening_hours = g.opening_hours
 
-            # Merge flags & enrichments
             o.emergency_flag = o.emergency_flag or g.emergency_flag
             o.supports_mobile = o.supports_mobile or g.supports_mobile
 
@@ -1205,7 +1102,6 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
             o.specialists |= g.specialists
             o.service_codes |= g.service_codes
 
-            # Service flags
             if "dental" in o.service_codes:
                 o.offers_dental = True
         else:
@@ -1215,22 +1111,98 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
     return merged
 
 # ----------------------------
-# Export helpers
+# Vet-only + region filtering
 # ----------------------------
 
-def clinic_to_row(c: Clinic, created_ts: str) -> Dict[str, Any]:
-    opening = c.opening_hours or ""
+VET_NAME_HINTS = [
+    "tierarzt",
+    "tierärzt",           # catches tierärzte, tierärztlich, etc.
+    "tierarztpraxis",
+    "tierärztliche",
+    "tierklinik",
+    "kleintierpraxis",
+    "kleintierklinik",
+    "tierpraxis",
+]
 
-    # Structured opening-hours (max parser)
+BAD_NAME_KEYWORDS = [
+    "hundeschule",
+    "hundezentrum",
+    "dogschool",
+    "dog school",
+    "dogtrainer",
+    "dog trainer",
+    "tierheilpraktiker",
+    "heilpraktiker",
+    "grooming",
+    "hundefriseur",
+    "fellpflege",
+    "futterhaus",
+    "tierbedarf",
+    "pet shop",
+    "zoofachhandel",
+    "zoohandlung",
+    "tierpension",
+    "hundepension",
+    "katzenpension",
+    "sitter",
+    "dogwalking",
+    "dog walking",
+]
+
+def is_definitely_non_vet(name: str) -> bool:
+    low = (name or "").lower()
+
+    # If it clearly looks like a veterinary practice, NEVER auto-drop it,
+    # even if it mentions Hundeschule, Shop, etc.
+    if any(v in low for v in VET_NAME_HINTS):
+        return False
+
+    # Otherwise, if it looks like a pure trainer/boarding/shop/etc → drop
+    return any(b in low for b in BAD_NAME_KEYWORDS)
+
+def filter_to_vets_region(clinics: List[Clinic], bbox: Tuple[float,float,float,float]) -> List[Clinic]:
+    """Keep all vet-like clinics inside the bbox (Berlin + nearby region),
+    only drop things that are clearly non-vet, then dedupe by name+location.
+    """
+    filtered: List[Clinic] = []
+
+    for c in clinics:
+        # Must have coordinates inside bbox
+        if not (c.lat and c.lng and within_bbox(c.lat, c.lng, bbox)):
+            continue
+
+        # Drop only if it's clearly a non-vet business
+        if is_definitely_non_vet(c.name):
+            continue
+
+        filtered.append(c)
+
+    # Deduplicate by (normalized name, lat, lng)
+    seen = set()
+    uniq: List[Clinic] = []
+    for c in filtered:
+        key = (norm_name_for_match(c.name), round(c.lat or 0, 5), round(c.lng or 0, 5))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(c)
+
+    print(f"✅ After vet+region filtering & dedupe: {len(uniq)} clinics")
+    return uniq
+
+# ----------------------------
+# Export helpers (DB-ready)
+# ----------------------------
+
+def clinic_to_opening_obj(c: Clinic) -> Dict[str, Any]:
+    opening = c.opening_hours or ""
     struct = parse_opening_hours_to_struct(opening)
     is_247 = infer_is_247(opening, struct)
-
-    # Emergency: combine all heuristics
     hours_emergency = infer_emergency_from_hours(struct)
     text_emergency = derive_emergency(opening, c.name, "", None)
     is_emergency = bool(c.emergency_flag) or hours_emergency or text_emergency
-
-    opening_obj = {
+    return {
         "raw": opening,
         "structured": struct,
         "is_247": is_247,
@@ -1238,133 +1210,129 @@ def clinic_to_row(c: Clinic, created_ts: str) -> Dict[str, Any]:
         "source": c.source,
     }
 
-    return {
-        "id": c.id,
-        "name": c.name or "",
-        "street": c.street or "",
-        "district": c.district or "",
-        "city": c.city or "",
-        "postcode": c.postcode or "",
-        "lat": c.lat,
-        "lng": c.lng,
-        "phone": c.phone or "",
-        "email": c.email or "",
-        "website": c.website or "",
-        "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
-        "emergency": bool(is_emergency),
-        "active": True,
-        "created_at": created_ts,
-        "updated_at": created_ts,
-        "description": "",
-        "emergency_boolean": bool(is_emergency),
-        "active_boolean": True,
-        "booking_enabled": False,
-        "supports_mobile": bool(c.supports_mobile),
-        "twentyfour_seven": bool(is_247),
-        "got_min_multiplier": "",
-        "got_max_multiplier": "",
-        "weekend_min_multiplier": "",
-        "notdienst_fee_eur": "",
-        "got_notes": "",
-        "weekend_policy_notes": "",
-        "travel_cost_per_double_km_eur": "",
-        "travel_cost_min_eur": "",
-        "mobile_service_area_km": "",
-        "offers_vaccination": True,
-        "offers_checkup": True,
-        "offers_illness": True,
-        "offers_prescription": True,
-        "offers_dental": bool(c.offers_dental),
-        "auth_user_id": "",
-        "contact_email": c.email or "",
-        "onboarding_status": "not_invited",
-        "invite_sent_at": "",
-        "last_login_at": "",
-    }
-
-def export_clinics_csv(clinics: List[Clinic], out_dir: str, city_slug: str):
+def export_db_csvs(clinics: List[Clinic], out_dir: str, city_slug: str):
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, f"clinics_{city_slug}.csv")
-    jsonl_path = os.path.join(out_dir, f"clinics_{city_slug}.jsonl")
 
-    created_ts = now_ts()
-    rows = [clinic_to_row(c, created_ts) for c in clinics]
+    # Map Clinic objects → UUIDs
+    clinic_ids: Dict[int, str] = {}
+    for idx, c in enumerate(clinics):
+        clinic_ids[idx] = str(uuid.uuid4())
 
-    # CSV
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    # 1) Clinics
+    clinics_path = os.path.join(out_dir, f"clinics_{city_slug}_db.csv")
+    with open(clinics_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CLINIC_DB_COLUMNS)
         w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in CLINIC_DB_COLUMNS})
 
-    # JSONL (optional, nice for debugging / agents)
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps({k: r.get(k, "") for k in CLINIC_DB_COLUMNS}, ensure_ascii=False) + "\n")
+        for idx, c in enumerate(clinics):
+            cid = clinic_ids[idx]
+            opening_obj = clinic_to_opening_obj(c)
+            is_247 = bool(opening_obj["is_247"])
+            is_emergency = bool(opening_obj["emergency"])
 
-    print(f"✅ Exported clinics CSV → {csv_path}")
-    print(f"✅ Exported clinics JSONL → {jsonl_path}")
+            row = {
+                "id": cid,
+                "name": c.name or "",
+                "street": c.street or "",
+                "district": c.district or "",
+                "city": c.city or "",
+                "postcode": c.postcode or "",
+                "lat": c.lat,
+                "lng": c.lng,
+                "phone": c.phone or "",
+                "email": c.email or "",
+                "website": c.website or "",
+                "opening_hours": json.dumps(opening_obj, ensure_ascii=False),
+                "emergency": is_emergency,
+                "active": True,
+                "description": "",
+                "emergency_boolean": is_emergency,
+                "active_boolean": True,
+                "booking_enabled": False,
+                "supports_mobile": bool(c.supports_mobile),
+                "twentyfour_seven": is_247,
+                "got_min_multiplier": "",
+                "got_max_multiplier": "",
+                "weekend_min_multiplier": "",
+                "notdienst_fee_eur": "",
+                "got_notes": "",
+                "weekend_policy_notes": "",
+                "travel_cost_per_double_km_eur": "",
+                "travel_cost_min_eur": "",
+                "mobile_service_area_km": "",
+                "offers_vaccination": True,
+                "offers_checkup": True,
+                "offers_illness": True,
+                "offers_prescription": True,
+                "offers_dental": bool(c.offers_dental),
+                "auth_user_id": "",
+                "contact_email": c.email or "",
+                "onboarding_status": "not_invited",
+                "invite_sent_at": "",
+                "last_login_at": "",
+            }
 
-def export_clinic_pet_types(clinics: List[Clinic], out_dir: str, city_slug: str):
-    path = os.path.join(out_dir, f"clinic_pet_types_{city_slug}.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_PET_TYPES_DB_COLUMNS)
+            w.writerow(row)
+
+    print(f"✅ Exported DB clinics CSV → {clinics_path}")
+
+    # 2) Pet types
+    pet_path = os.path.join(out_dir, f"clinic_pet_types_{city_slug}_db.csv")
+    with open(pet_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PET_TYPES_COLUMNS_DB)
         w.writeheader()
-        for c in clinics:
-            if not c.id:
-                continue
+        for idx, c in enumerate(clinics):
+            cid = clinic_ids[idx]
             for pet in sorted(c.pet_types):
                 w.writerow({
-                    "clinic_id": c.id,
+                    "clinic_id": cid,
                     "pet": pet,
                 })
-    print(f"✅ Exported clinic_pet_types CSV → {path}")
+    print(f"✅ Exported DB clinic_pet_types CSV → {pet_path}")
 
-def export_clinic_services(clinics: List[Clinic], out_dir: str, city_slug: str):
-    path = os.path.join(out_dir, f"clinic_services_{city_slug}.csv")
-    created_ts = now_ts()
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_DB_COLUMNS)
+    # 3) Services
+    svc_path = os.path.join(out_dir, f"clinic_services_{city_slug}_db.csv")
+    with open(svc_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CLINIC_SERVICES_COLUMNS_DB)
         w.writeheader()
-        for c in clinics:
-            if not c.id:
-                continue
-            codes = set(c.service_codes or set())
+        for idx, c in enumerate(clinics):
+            cid = clinic_ids[idx]
+            codes = set(c.service_codes)
             if c.emergency_flag:
                 codes.add("emergency")
             for code in sorted(codes):
+                sid = str(uuid.uuid4())
                 label = SERVICE_LABELS.get(code, code.replace("_", " ").title())
                 w.writerow({
-                    "id": gen_uuid(),
-                    "clinic_id": c.id,
+                    "id": sid,
+                    "clinic_id": cid,
                     "service_code": code,
                     "label": label,
                     "got_ref": "",
                     "price_min_eur": "",
                     "price_max_eur": "",
                     "notes": "",
-                    "created_at": created_ts,
-                    "updated_at": created_ts,
+                    "created_at": "",
+                    "updated_at": "",
                     "name": label,
                     "description": "",
                     "icon": "",
                 })
-    print(f"✅ Exported clinic_services CSV → {path}")
+    print(f"✅ Exported DB clinic_services CSV → {svc_path}")
 
-def export_clinic_specialists(clinics: List[Clinic], out_dir: str, city_slug: str):
-    path = os.path.join(out_dir, f"clinic_specialists_{city_slug}.csv")
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=CLINIC_SPECIALISTS_DB_COLUMNS)
+    # 4) Specialists
+    spec_path = os.path.join(out_dir, f"clinic_specialists_{city_slug}_db.csv")
+    with open(spec_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CLINIC_SPECIALISTS_COLUMNS_DB)
         w.writeheader()
-        for c in clinics:
-            if not c.id:
-                continue
+        for idx, c in enumerate(clinics):
+            cid = clinic_ids[idx]
             for area in sorted(c.specialists):
                 w.writerow({
-                    "clinic_id": c.id,
+                    "clinic_id": cid,
                     "area": area,
                 })
-    print(f"✅ Exported clinic_specialists CSV → {path}")
+    print(f"✅ Exported DB clinic_specialists CSV → {spec_path}")
 
 # ----------------------------
 # Main
@@ -1393,7 +1361,7 @@ def main():
         print(f"— OSM tile {i}/{len(tiles)}")
         osm_all.extend(fetch_osm_veterinary(tb, args.max_results, city, args.enrich_websites))
 
-    # Deduplicate OSM by (name, lat, lng)
+    # Deduplicate OSM first
     seen = set()
     osm_uniq: List[Clinic] = []
     for c in osm_all:
@@ -1414,41 +1382,12 @@ def main():
     if not args.no_geocode:
         merged = fill_missing_address(merged)
 
-    # Still respect BBOX
-    merged = [c for c in merged if c.lat and c.lng and within_bbox(c.lat, c.lng, bbox)]
+    # Final vet+region filtering (no hard postcode/city requirement, just bbox + non-vet exclusion)
+    cleaned = filter_to_vets_region(merged, bbox)
 
-    # Berlin-only + vet-only filter + postcode & dedupe
-    filtered: List[Clinic] = []
-    for c in merged:
-        city_clean = (c.city or "").strip().lower()
-        if city_clean != "berlin":
-            continue
-        if not c.postcode or not is_berlin_postcode(c.postcode):
-            continue
-        if not is_likely_vet(c.name):
-            continue
-        filtered.append(c)
+    print(f"🧹 Final clinic count after merge + vet/region filters: {len(cleaned)}")
 
-    uniq: List[Clinic] = []
-    seen_keys = set()
-    for c in filtered:
-        key = (norm_name_for_match(c.name), str(c.postcode))
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        uniq.append(c)
-
-    print(f"🧹 Final clinic count after merge + geocode + Berlin/vet filters + dedupe: {len(uniq)}")
-
-    # Assign UUIDs to each clinic for DB IDs
-    for c in uniq:
-        c.id = gen_uuid()
-
-    # Export DB-aligned CSVs
-    export_clinics_csv(uniq, args.output_dir, city_slug)
-    export_clinic_pet_types(uniq, args.output_dir, city_slug)
-    export_clinic_services(uniq, args.output_dir, city_slug)
-    export_clinic_specialists(uniq, args.output_dir, city_slug)
+    export_db_csvs(cleaned, args.output_dir, city_slug)
 
 if __name__ == "__main__":
     main()

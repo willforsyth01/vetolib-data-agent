@@ -5,10 +5,10 @@
 Vetolib Region Crawler — Clinics + Pet Types + Services + Specialists (DB-ready)
 
 Scope:
-- Berlin region (using BERLIN_BBOX, includes Teltow / Brandenburg inside bbox)
-- Vets only (OSM + Google Places "veterinary_care")
+- Berlin region (using BERLIN_BBOX, includes nearby Brandenburg/Teltow inside bbox)
+- Vets only (OSM + optional Google Places "veterinary_care")
 - Large pool kept, only clearly non-vet businesses removed
-- Outputs 5 files in ./out:
+- Outputs 5 files in the chosen directory (default: current dir):
 
   1) clinics_<city>.csv
      → matches public.clinics (explicit id, ready for import)
@@ -1119,7 +1119,7 @@ def merge_osm_and_google(osm_clinics: List[Clinic], google_clinics: List[Clinic]
 
 VET_NAME_HINTS = [
     "tierarzt",
-    "tierärzt",           # catches tierärzte, tierärztlich, etc.
+    "tierärzt",
     "tierarztpraxis",
     "tierärztliche",
     "tierklinik",
@@ -1350,7 +1350,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--city", default=CITY_DEFAULT)
     parser.add_argument("--max-results", type=int, default=5000)
-    parser.add_argument("--output-dir", default="./out")
+    parser.add_argument("--output-dir", default=".", help="Directory to write CSV/JSONL files (default: current dir)")
     parser.add_argument("--tiles", type=int, default=2)
     parser.add_argument("--no-geocode", action="store_true")
     parser.add_argument("--enrich-websites", action="store_true")
@@ -1380,7 +1380,7 @@ def main():
         osm_uniq.append(c)
 
     google_clinics: List[Clinic] = []
-    if args.use_google_places:
+    if args.use-google-places:
         google_clinics = fetch_google_clinics(bbox, args.tiles, city)
     else:
         print("ℹ️ Skipping Google Places (flag --use-google-places not set).")

@@ -80,6 +80,7 @@ jobs:
         run: |
           set -e
 
+          # Defaults for FULL run
           if [ "$MODE" = "full" ]; then
             MAX_RESULTS="${MAX_RESULTS:-5000}"
             TILES="${TILES:-3}"
@@ -87,7 +88,7 @@ jobs:
             ENRICH="${ENRICH:-true}"
           fi
 
-          FLAGS="--city Berlin --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ."
+          FLAGS="--city Berlin --max-results ${MAX_RESULTS} --tiles ${TILES}"
 
           if [ "$GEOCODE" = "false" ]; then
             FLAGS="$FLAGS --no-geocode"
@@ -119,17 +120,26 @@ jobs:
             }
           done
 
-          echo "Run complete."
-          ls -la || true
+          echo "Run complete. Listing files in workspace:"
+          ls -la
+
+          echo "Searching for generated clinic files:"
+          find . -maxdepth 4 -type f \( \
+            -name 'clinics_berlin.csv' -o \
+            -name 'clinics_berlin.jsonl' -o \
+            -name 'clinic_services_berlin.csv' -o \
+            -name 'clinic_specialists_berlin.csv' -o \
+            -name 'clinic_pet_types_berlin.csv' \
+          \) -print || true
 
       - name: Upload CSV + JSONL outputs
         uses: actions/upload-artifact@v4
         with:
           name: vetolib-berlin-${{ github.event.inputs.mode || 'test' }}
           path: |
-            clinics_berlin.csv
-            clinics_berlin.jsonl
-            clinic_services_berlin.csv
-            clinic_specialists_berlin.csv
-            clinic_pet_types_berlin.csv
+            **/clinics_berlin.csv
+            **/clinics_berlin.jsonl
+            **/clinic_services_berlin.csv
+            **/clinic_specialists_berlin.csv
+            **/clinic_pet_types_berlin.csv
           if-no-files-found: error

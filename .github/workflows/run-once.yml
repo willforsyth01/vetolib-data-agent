@@ -80,7 +80,6 @@ jobs:
         run: |
           set -e
 
-          # Defaults for FULL run
           if [ "$MODE" = "full" ]; then
             MAX_RESULTS="${MAX_RESULTS:-5000}"
             TILES="${TILES:-3}"
@@ -88,16 +87,14 @@ jobs:
             ENRICH="${ENRICH:-true}"
           fi
 
-          FLAGS="--city \"Berlin\" --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ./out"
+          FLAGS="--city Berlin --max-results ${MAX_RESULTS} --tiles ${TILES} --output-dir ."
 
           if [ "$GEOCODE" = "false" ]; then
             FLAGS="$FLAGS --no-geocode"
           fi
-
           if [ "$ENRICH" = "true" ]; then
             FLAGS="$FLAGS --enrich-websites"
           fi
-
           if [ "$GOOGLE" = "true" ]; then
             FLAGS="$FLAGS --use-google-places"
           fi
@@ -112,8 +109,6 @@ jobs:
         shell: bash
         run: |
           set -e
-          mkdir -p out
-
           echo "Running crawler:"
           echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
 
@@ -125,16 +120,16 @@ jobs:
           done
 
           echo "Run complete."
-          ls -la out || true
+          ls -la || true
 
       - name: Upload CSV + JSONL outputs
         uses: actions/upload-artifact@v4
         with:
           name: vetolib-berlin-${{ github.event.inputs.mode || 'test' }}
           path: |
-            out/clinics_berlin.csv
-            out/clinics_berlin.jsonl
-            out/clinic_services_berlin.csv
-            out/clinic_specialists_berlin.csv
-            out/clinic_pet_types_berlin.csv
+            clinics_berlin.csv
+            clinics_berlin.jsonl
+            clinic_services_berlin.csv
+            clinic_specialists_berlin.csv
+            clinic_pet_types_berlin.csv
           if-no-files-found: error

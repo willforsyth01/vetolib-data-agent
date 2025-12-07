@@ -44,19 +44,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Verify repo contents
-        id: locate
-        shell: bash
-        run: |
-          set -e
-          CRAWLER="$(git ls-files | grep -E '(^|/|\\)vetolib_berlin_crawler\.py$' | head -n 1 || true)"
-          REQS="$(git ls-files | grep -E '(^|/|\\)requirements\.txt$' | head -n 1 || true)"
-          test -n "$CRAWLER" || { echo "❌ Missing vetolib_berlin_crawler.py"; exit 1; }
-          test -n "$REQS" || { echo "❌ Missing requirements.txt"; exit 1; }
-          echo "crawler=$CRAWLER" >> "$GITHUB_OUTPUT"
-          echo "reqs=$REQS" >> "$GITHUB_OUTPUT"
-          echo "✅ Found: $CRAWLER and $REQS"
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -65,7 +52,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r "${{ steps.locate.outputs.reqs }}"
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found, continuing..."
+          fi
 
       - name: Build flags
         id: cmd
@@ -80,7 +71,6 @@ jobs:
         run: |
           set -e
 
-          # Defaults for FULL run
           if [ "$MODE" = "full" ]; then
             MAX_RESULTS="${MAX_RESULTS:-5000}"
             TILES="${TILES:-3}"
@@ -110,11 +100,12 @@ jobs:
         shell: bash
         run: |
           set -e
+
           echo "Running crawler:"
-          echo "python \"${{ steps.locate.outputs.crawler }}\" ${{ steps.cmd.outputs.flags }}"
+          echo "python vetolib_berlin_crawler.py ${{ steps.cmd.outputs.flags }}"
 
           for i in 1 2 3; do
-            python "${{ steps.locate.outputs.crawler }}" ${{ steps.cmd.outputs.flags }} && break || {
+            python vetolib_berlin_crawler.py ${{ steps.cmd.outputs.flags }} && break || {
               echo "Attempt $i failed, retrying..."
               sleep $((10*i))
             }
@@ -123,23 +114,14 @@ jobs:
           echo "Run complete. Listing files in workspace:"
           ls -la
 
-          echo "Searching for generated clinic files:"
-          find . -maxdepth 4 -type f \( \
-            -name 'clinics_berlin.csv' -o \
-            -name 'clinics_berlin.jsonl' -o \
-            -name 'clinic_services_berlin.csv' -o \
-            -name 'clinic_specialists_berlin.csv' -o \
-            -name 'clinic_pet_types_berlin.csv' \
-          \) -print || true
+          echo "Searching for any CSV/JSONL outputs:"
+          find . -maxdepth 4 -type f \( -name '*.csv' -o -name '*.jsonl' \) -print || true
 
-      - name: Upload CSV + JSONL outputs
+      - name: Upload ALL CSV + JSONL outputs
         uses: actions/upload-artifact@v4
         with:
           name: vetolib-berlin-${{ github.event.inputs.mode || 'test' }}
           path: |
-            **/clinics_berlin.csv
-            **/clinics_berlin.jsonl
-            **/clinic_services_berlin.csv
-            **/clinic_specialists_berlin.csv
-            **/clinic_pet_types_berlin.csv
+            **/*.csv
+            **/*.jsonl
           if-no-files-found: error
